@@ -1,0 +1,57 @@
+test2:
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                        CritiGraph.loom         0.00%       0.000us         0.00%       0.000us       0.000us        3.100s       131.59%        3.100s       6.199ms           500  
+                                        CritiGraph.loom         5.40%     288.314ms        67.92%        3.624s       7.248ms       0.000us         0.00%        2.280s       4.560ms           500  
+enumerate(DataLoader)#_SingleProcessDataLoaderIter._...         0.00%       0.000us         0.00%       0.000us       0.000us        1.475s        62.63%        1.475s       2.950ms           500  
+                                            aten::index         2.75%     146.738ms        42.42%        2.263s     305.817us     820.715ms        34.84%     832.562ms     112.493us          7401  
+void at::native::index_elementwise_kernel<128, 4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     797.239ms        33.85%     797.239ms     398.620us          2000  
+                                              aten::mul         0.74%      39.495ms         1.18%      62.986ms      18.520us     530.515ms        22.52%     530.515ms     155.988us          3401  
+void at::native::unrolled_elementwise_kernel<at::nat...         0.00%       0.000us         0.00%       0.000us       0.000us     438.992ms        18.64%     438.992ms     182.837us          2401  
+                              CritiGraph.neighbor_batch         0.00%       0.000us         0.00%       0.000us       0.000us     410.721ms        17.44%     410.721ms     821.442us           500  
+                                              aten::sub         0.38%      20.221ms         0.60%      31.970ms      15.985us     309.068ms        13.12%     309.068ms     154.534us          2000  
+                                            aten::copy_         4.21%     224.616ms        78.39%        4.183s      81.736us     214.557ms         9.11%     220.431ms       4.308us         51172  
+                                              aten::abs         0.67%      35.934ms         2.36%     126.127ms      21.021us      97.753ms         4.15%     195.505ms      32.584us          6000  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     177.769ms         7.55%     177.769ms     177.769us          1000  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     131.876ms         5.60%     131.876ms     263.752us           500  
+                                      aten::bitwise_xor         0.49%      26.079ms         0.90%      48.109ms      24.054us      94.995ms         4.03%      94.995ms      47.498us          2000  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us      94.995ms         4.03%      94.995ms      47.498us          2000  
+                                              aten::div         0.21%      11.011ms         0.32%      17.189ms      17.172us      92.311ms         3.92%      92.311ms      92.219us          1001  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us      91.523ms         3.89%      91.523ms      91.523us          1000  
+                                              aten::add         0.21%      11.430ms         0.35%      18.516ms      18.516us      90.326ms         3.83%      90.326ms      90.326us          1000  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us      90.150ms         3.83%      90.150ms      90.150us          1000  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us      89.009ms         3.78%      89.009ms     178.018us           500  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 5.336s
+Self CUDA time total: 2.355s
+
+
+
+hm_cte:
+------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                        CritiGraph.loom         0.00%       0.000us         0.00%       0.000us       0.000us        6.427s       190.95%        6.427s       2.009ms          3200  
+                                        CritiGraph.loom        18.10%        1.679s        93.28%        8.650s       2.703ms       0.000us         0.00%        3.341s       1.044ms          3200  
+                              CritiGraph.neighbor_batch         0.00%       0.000us         0.00%       0.000us       0.000us        1.615s        47.98%        1.615s     504.637us          3200  
+                                              aten::mul         2.05%     189.843ms         3.30%     306.210ms      15.947us     838.172ms        24.90%     838.172ms      43.650us         19202  
+                                              aten::sub         1.44%     133.925ms         2.26%     209.429ms      16.360us     610.781ms        18.15%     610.781ms      47.714us         12801  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     607.150ms        18.04%     607.150ms      63.245us          9600  
+                                              aten::abs         2.48%     230.130ms         8.77%     813.335ms      21.178us     250.215ms         7.43%     500.429ms      13.031us         38404  
+                                            aten::index         4.55%     421.958ms        12.75%        1.182s      61.576us     397.866ms        11.82%     453.539ms      23.618us         19203  
+void at::native::unrolled_elementwise_kernel<at::nat...         0.00%       0.000us         0.00%       0.000us       0.000us     416.938ms        12.39%     416.938ms      43.426us          9601  
+void at::native::index_elementwise_kernel<128, 4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     343.483ms        10.20%     343.483ms      35.776us          9601  
+                                      aten::bitwise_xor         1.65%     152.616ms         2.62%     242.606ms      18.952us     236.018ms         7.01%     236.018ms      18.437us         12801  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     236.018ms         7.01%     236.018ms      18.437us         12801  
+                                              aten::div         0.75%      69.294ms         1.19%     110.033ms      17.193us     221.463ms         6.58%     221.463ms      34.604us          6400  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     213.623ms         6.35%     213.623ms      33.373us          6401  
+void at::native::elementwise_kernel<128, 4, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     207.611ms         6.17%     207.611ms      64.879us          3200  
+                                             aten::rsub         0.36%      33.585ms         1.49%     138.344ms      21.613us       0.000us         0.00%     206.691ms      32.290us          6401  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     206.691ms         6.14%     206.691ms      32.290us          6401  
+                                              aten::add         0.41%      37.991ms         0.64%      58.884ms      18.118us     203.183ms         6.04%     203.183ms      62.518us          3250  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     200.918ms         5.97%     200.918ms      61.821us          3250  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     200.826ms         5.97%     200.826ms      62.758us          3200  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 9.273s
+Self CUDA time total: 3.366s

@@ -1,0 +1,47 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python: hm_gpt_par",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/hm_gpt_par.py",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "env": {
+        "ROLE": "par",
+        "CUDA_VISIBLE_DEVICES": "0"
+      }
+    },
+    {
+      "name": "Python: hm_gpt_gt",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/hm_gpt_gt.py",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "env": {
+        "ROLE": "gt",
+        "CUDA_VISIBLE_DEVICES": "1"
+      }
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Debug: par + gt (parallel)",
+      "configurations": [
+        "Python: hm_gpt_par",
+        "Python: hm_gpt_gt"
+      ],
+      "stopAll": true
+    },
+    {
+      "name": "Debug: gt -> par (sequential start)",
+      "configurations": [
+        "Python: hm_gpt_gt",
+        "Python: hm_gpt_par"
+      ],
+      "stopAll": true
+    }
+  ]
+}
