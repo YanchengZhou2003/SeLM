@@ -33,8 +33,7 @@ class CritiGraph(torch.nn.Module):
         self.n = int(2**h)
         self.c = c
                                             # 此处是个很重要的改动
-        self.k = int(int(c*h) // 4)
-        # self.k = int(c*h)
+        self.k = int(int(c*h) // 3)
         
         ### ---- 设备/进程信息 ---- ###
         self.devices = [torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())]
@@ -76,7 +75,7 @@ class CritiGraph(torch.nn.Module):
     
     def main_distance(self, coord1, coord2):
         coord1, coord2 = coord1.clone().cpu(), coord2.clone().cpu()
-        sg = (((coord1 >= 0).to(torch.int16) << 1) - 1) * (((coord2 >= 0).to(torch.int16) << 1) - 1)
+        sg = 1 - (((coord1 >= 0) ^ (coord2 >= 0)).to(torch.int16) << 1) 
         xor_result = torch.bitwise_xor(torch.abs(coord1), torch.abs(coord2))
         s = self.main_distance_lookup_table[xor_result]
         return sg * (1 - s)
@@ -126,8 +125,6 @@ class CritiGraph(torch.nn.Module):
                 indices = torch.randperm(cnc_loc.size(2), device=dev) 
                 cnc_loc = cnc_loc[:, :, indices, :]
                 mask0 = mask.unsqueeze(-1).unsqueeze(-1)
-                
-                
                 dis_sta_pos = self.distance(sta_loc[:,:,None,:], sta_loc[:,None,:,:], dev_num=dev_num) # (B, T, T, D)
 
                 dis_sta_posum = dis_sta_pos.sum(dim=-1) # (B, T, T)
@@ -239,8 +236,8 @@ class CritiGraph(torch.nn.Module):
                             all_selected_locs,
                             all_loss)
             if jug == 0 and epoch < epoch_thr:
-                if tot <= 0.04:
-                    epoch_max = min(50, int(epoch * 1.25) + 1)
+                if tot <= 0.025:
+                    epoch_max = int(epoch * 1.25) + 1
                     jug = 1
                     print('epoch_max:', epoch_max)
             epoch += 1       

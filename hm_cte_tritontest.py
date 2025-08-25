@@ -15,6 +15,8 @@ from scipy.spatial.distance import pdist
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
+from loom_tritontest import triton_loom_wrapper
+
 main_device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 from typing import List, Tuple
 
@@ -63,15 +65,12 @@ class CritiGraph(torch.nn.Module):
     
     # @torch.jit
     def distance(self, coord1, coord2, dev_num=0):
-        # sg = torch.sign(coord1) * torch.sign(coord2)
+        # coord1.shape: (B, T, 1, D) 或者 (B, 1, T, 1, D)
+        # coord2.shape: (B, 1, T, D) 或者 (B, T, 1, C, D)
+        # 对应乘后，得到 (B, T, T, D) 或者 (B, T, T, C, D)
         sg = (((coord1 >= 0).to(torch.int16) << 1) - 1) * (((coord2 >= 0).to(torch.int16) << 1) - 1)
-        # sg = 1 - (((coord1 >= 0) ^ (coord2 >= 0)).to(torch.int16) << 1) 
-        
         xor_result = torch.bitwise_xor(torch.abs(coord1), torch.abs(coord2))
-        # 关键替换：用 frexp 得到 log2_floor+1
-        # _, exp = torch.frexp((xor_result + 1).to(torch.float32))
-        # s = exp.float() / self.h
-        s = self.distance_lookup_table[dev_num][xor_result]
+        s = self.distance_lookup_table[dev_num][xor_result] # lookup table 的 shape 为 (n, ), n = 1 << h，典型数值为 h = 27, n = 2 ** 27
         return sg * (1 - s)
     
     def main_distance(self, coord1, coord2):
@@ -96,13 +95,11 @@ class CritiGraph(torch.nn.Module):
     def loom(self, epoch, batch: Tuple[torch.Tensor, torch.Tensor],
              all_selected_locs: torch.Tensor,
              all_loss: torch.Tensor): # 注：传入张量在 CPU 的 pinned memory 上
+        ### 典型数值：all_B = 64, T = 256, C = 2 * k * h = 500 ~ 2000, D = 3
+        
         all_B, T = batch[0].shape
         splits = torch.linspace(0, all_B, len(self.devices) + 1, dtype=torch.int64).tolist()
         splits = list(map(int, splits))
-        
-        
-        # all_selected_locs = torch.zeros((all_B, T, self.tp), dtype=torch.int64, pin_memory=True)
-        # all_loss = torch.zeros(len(self.devices), dtype=torch.float, pin_memory=True)
         
         for i, (dev, stream, (s,e)) in enumerate(zip(self.devices, self.streams, zip(splits[:-1], splits[1:]))):
             if s == e: continue
@@ -125,37 +122,28 @@ class CritiGraph(torch.nn.Module):
                 cnc_loc = self.connection(abs_sta_loc, dev_num=dev_num).view(B, self.blk_size, -1, self.tp) #(B, T, C, D)
                 indices = torch.randperm(cnc_loc.size(2), device=dev) 
                 cnc_loc = cnc_loc[:, :, indices, :]
-                mask0 = mask.unsqueeze(-1).unsqueeze(-1)
                 
-                
+                # 用 Triton 算子替换掉之前的所有计算, 传递所有需要的输入张量
+                selected_locs, min_loss = triton_loom_wrapper(
+                    sta_loc=sta_loc,
+                    cnc_loc=cnc_loc,
+                    logits=logits,
+                    lg=lg,
+                    mask=mask,
+                    distance_lookup_table=self.distance_lookup_table[dev_num],
+                    tp=self.tp
+                )
+                tl = min_loss.mean() * B
+                '''原来的 pytorch 逻辑
+                mask0 = mask.unsqueeze(-1).unsqueeze(-1) # mask0: (B, T, T, 1, 1)
                 dis_sta_pos = self.distance(sta_loc[:,:,None,:], sta_loc[:,None,:,:], dev_num=dev_num) # (B, T, T, D)
-
                 dis_sta_posum = dis_sta_pos.sum(dim=-1) # (B, T, T)
-                
-                # # -------- Origin --------- #
                 logits_ct = self.distance(sta_loc[:,None,:,None,:], cnc_loc[:,:,None,:,:], dev_num=dev_num) # (B, T, T, C, D)
                 logits_ct = (logits_ct-dis_sta_pos[:,:,:,None,:]+dis_sta_posum[:,:,:,None,None]) / self.tp # (B, T, T, C, D)
                 logits_ct = logits_ct * mask0 # (B, T, T, C, D)
                 logits_eu = logits.unsqueeze(3).unsqueeze(4) * mask0 # (B, T, T, C, D)
-                delt = logits_ct - logits_eu
+                delt = logits_ct - logits_eu # (B, T, T, C, D)
                 total_loss = torch.abs(delt).sum(dim=2) / lg[:,:,None, None] # (B, T, C, D)
-                
-                # # -------- Tty 
-                # # 1) 计算 logits_ct 到工作缓冲（后续全就地）
-                # logits_ct = self.distance(sta_loc[:,None,:,None,:], cnc_loc[:,:,None,:,:], dev_num=dev_num)
-
-                # # 2) 就地执行  -dis_sta_pos + dis_sta_posum，除以 tp，再乘 mask
-                # logits_ct.sub_(dis_sta_pos[:,:,:,None,:])                      # in-place
-                # logits_ct.add_(dis_sta_posum[:,:,:,None,None])                 # in-place
-                # logits_ct.mul_(1.0/self.tp)                                    # in-place
-                # logits_ct.mul_(mask0)                                          # in-place
-
-                # # 3) 复用同一缓冲完成 delt 与 |·|，不再额外做一份 (B,T,T,C,D)
-                # logits_ct.sub_(logits.unsqueeze(3).unsqueeze(4))               # in-place 广播减
-                # logits_ct.abs_()                                               # in-place 取绝对值
-
-                # # 4) 归约到 (B,T,C,D)
-                # total_loss = logits_ct.sum(dim=2) / lg[:,:,None,None]
                 
                 index = torch.argmin(total_loss, dim=2) # (B, T, D)
                 batch_indices = torch.arange(B, device=dev)[:, None, None]
@@ -163,6 +151,7 @@ class CritiGraph(torch.nn.Module):
                 dim_indices = torch.arange(self.tp, device=dev)[None, None, :]
                 selected_locs = cnc_loc[batch_indices, time_indices, index, dim_indices]
                 tl = total_loss[batch_indices, time_indices, index, dim_indices].mean() * B
+                '''
                 ### 计算：计算结束 ###
                 
                 ### 通信2：数据传输开始 ###
@@ -221,12 +210,10 @@ class CritiGraph(torch.nn.Module):
         
         all_selected_locs = torch.zeros((idi.shape[0], idi.shape[1], self.tp), dtype=torch.int64, pin_memory=True)
         all_loss = torch.zeros(len(self.devices), dtype=torch.float, pin_memory=True)
-        jug = 0
-        epoch = 0
-        # for epoch in range(self.epoch):
-        epoch_max = self.epoch
-        epoch_thr = int(self.convergence * epoch_max)
-        while epoch < epoch_max:    
+        
+        
+        
+        for epoch in range(self.epoch):   
             current_time = datetime.now()
             perm = torch.randperm(idi_pinned.size(0), device='cpu')
             idi_pinned = idi_pinned[perm]
@@ -234,27 +221,21 @@ class CritiGraph(torch.nn.Module):
             # print("current_time:", current_time.strftime("%Y-%m-%d %H:%M:%S.%f"))
             total, ite = 0, 0
             
-            # st = time.perf_counter()
+            
             tot = self.loom(epoch, (idi_pinned, dismatrix_eu_pinned),
                             all_selected_locs,
                             all_loss)
-            if jug == 0 and epoch < epoch_thr:
-                if tot <= 0.04:
-                    epoch_max = min(50, int(epoch * 1.25) + 1)
-                    jug = 1
-                    print('epoch_max:', epoch_max)
             epoch += 1       
             total += tot
             ite += 1
             total /= ite
-            # ed = time.perf_counter()
             # print(f"Time Elapsed: {(ed - st) * 1000} ms")
             
             # print(epoch, 'average KL divergence:', total)
         
         ed = time.perf_counter()
         
-        # print(f"Time Elapsed: {(ed - st) * 1000.0} ms")
+        print(f"Time Elapsed: {(ed - st) * 1000.0} ms")
         
         self.main_locations = self.locations[0].clone().cpu()
         return self.distance(self.locations[0][idi].unsqueeze(2), self.locations[0][idi].unsqueeze(1)).mean(dim=-1)

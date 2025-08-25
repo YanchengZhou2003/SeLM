@@ -5,14 +5,14 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
+os.environ["CUDA_VISIBLE_DEVICES"] = "7"
 
-from hm_cte_testonly import *
+from hm_cte_back import *
 
 # hyperparameters - gpt
-batch_size = 64 # how many independent sequences will we process in parallel?
+batch_size = 56 # how many independent sequences will we process in parallel?
 block_size = 256 # what is the maximum context length for predictions?
-max_iters = 5000
+max_iters = 50000
 eval_interval = 100
 learning_rate = 3e-4
 device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
@@ -28,11 +28,12 @@ tp=2
 c=1 
 eps=1e-5 
 epoch_cte=50
-batch_size_cte=64
+batch_size_cte=56
 convergence=0.8
 
 # hyperparameters - combination
-ratio = 10
+ratio_cb = 10
+epoch_threshold = 3000
 # ------------
 
 torch.manual_seed(1337)
@@ -52,15 +53,18 @@ decode = lambda l: ''.join([itos[i] for i in l]) # decoder: take a list of integ
 
 # Train and test splits
 data = torch.tensor(encode(text), dtype=torch.long)
-datai = torch.tensor(range(len(data) - block_size), dtype=torch.long)
+datai = torch.tensor(range(len(data)), dtype=torch.long)
 n = int(0.9*len(data)) # first 90% will be train, rest val
 train_data = data[:n]
 val_data = data[n:]
+train_datai = datai[:n]
+val_datai = datai[n:]
 
 # data loading
 def get_batch(split):
     # generate a small batch of data of inputs x and targets y
     data = train_data if split == 'train' else val_data
+    datai = train_datai if split == 'train' else val_datai
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([data[i:i+block_size] for i in ix])
     xi = torch.stack([datai[i:i+block_size] for i in ix])
@@ -69,7 +73,7 @@ def get_batch(split):
     return x, xi, y
 
 @torch.no_grad()
-def estimate_loss(model):
+def estimate_loss(model, epoch):
     out = {}
     model.eval()
     for split in ['train', 'val']:
@@ -78,7 +82,7 @@ def estimate_loss(model):
         losses_gap = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, XI, Y = get_batch(split)
-            _, total_loss, loss_ori, loss_gap = model(X, XI, Y)
+            _, total_loss, loss_ori, loss_gap = model(X, XI, epoch, Y)
             total_losses[k] = total_loss.item()
             losses_ori[k] = loss_ori.item()
             losses_gap[k] = loss_gap.item()
@@ -178,7 +182,7 @@ class GPTLanguageModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, idi, targets=None):
+    def forward(self, idx, idi, epoch_ct, targets=None):
         B, T = idx.shape
         # idx and targets are both (B,T) tensor of integers
         tok_emb = self.token_embedding_table(idx) # (B,T,C)
@@ -197,15 +201,17 @@ class GPTLanguageModel(nn.Module):
             targets = targets.view(B*T)
             loss_ori = F.cross_entropy(logits, targets)
             
-            gap_weight = 10
-            x_norm = x / torch.norm(x, dim=-1, keepdim=True)
-            self.x = x_norm
-            dismatrix_eu = torch.matmul(x_norm, x_norm.transpose(1, 2))
-            # print(dismatrix_eu)
-            dismatrix_ct = self.cte(idi, dismatrix_eu)
-            delt = dismatrix_eu - dismatrix_ct
-            loss_gap = torch.abs(delt).mean()
-            total_loss = loss_ori + gap_weight * loss_gap
+            if epoch_ct > epoch_threshold:
+                x_norm = x / torch.norm(x, dim=-1, keepdim=True)
+                self.x = x_norm
+                dismatrix_eu = torch.matmul(x_norm, x_norm.transpose(1, 2))
+                # print(dismatrix_eu)
+                dismatrix_ct = self.cte(idi, dismatrix_eu)
+                delt = dismatrix_eu - dismatrix_ct
+                loss_gap = torch.abs(delt).mean()
+            else:
+                loss_gap = torch.tensor(0.0, device=x.device)
+            total_loss = loss_ori + ratio_cb * loss_gap
 
         return logits, total_loss, loss_ori, loss_gap
 
@@ -259,18 +265,19 @@ def train_model():
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     for iter in range(max_iters):
         if iter % eval_interval == 0 or iter == max_iters - 1:
-            losses = estimate_loss(model)
+            losses = estimate_loss(model, iter)
             print(f"step {iter}: train: total={losses['train'][0]:.4f}, ori={losses['train'][1]:.4f}, gap={losses['train'][2]:.8f}\
                 | val: total={losses['val'][0]:.4f}, ori={losses['val'][1]:.4f}, gap={losses['val'][2]:.8f}")
         xb, xi, yb = get_batch('train')
-        _, loss, _, _ = model(xb, xi, yb)
+        _, loss, _, _ = model(xb, xi, iter, yb)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
         if iter % eval_interval == 0 or iter == max_iters - 1:
             torch.save(model.state_dict(), 'gpt_model_dy.pth')
             print("Model saved to gpt_model_dy.pth")
-            visualize_similarity(xi)
+            if iter > epoch_threshold:
+                visualize_similarity(xi)
 
 if __name__ == "__main__":
     train_model()

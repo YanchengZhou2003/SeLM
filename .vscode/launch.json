@@ -2,15 +2,17 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Python: hm_gpt_par",
+      "name": "Python: hm_gpt_tritontest",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/hm_gpt_par.py",
+      "program": "${workspaceFolder}/hm_gpt_tritontest.py",
       "console": "integratedTerminal",
-      "justMyCode": true,
+      "justMyCode": false,
       "env": {
-        "ROLE": "par",
-        "CUDA_VISIBLE_DEVICES": "0"
+        "TRITON_CODEGEN_DEBUG": "1",
+        "TRITON_DUMP_LLVM": "1",
+        "TRITON_DUMP_ASM": "1",
+        "TRITON_INTERPRET": "1"
       }
     },
     {

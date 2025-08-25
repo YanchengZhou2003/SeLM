@@ -5,18 +5,18 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
+os.environ["CUDA_VISIBLE_DEVICES"] = "7"
 
-from hm_cte_testonly import *
+from hm_cte_tritontest import *
 
 # hyperparameters - gpt
-batch_size = 64 # how many independent sequences will we process in parallel?
+batch_size = 8 # how many independent sequences will we process in parallel?
 block_size = 256 # what is the maximum context length for predictions?
 max_iters = 5000
 eval_interval = 100
 learning_rate = 3e-4
 device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-eval_iters = 10
+eval_iters = 3
 n_embd = 384
 n_head = 6
 n_layer = 6
@@ -27,8 +27,8 @@ h=27
 tp=2
 c=1 
 eps=1e-5 
-epoch_cte=50
-batch_size_cte=64
+epoch_cte=20
+batch_size_cte=8
 convergence=0.8
 
 # hyperparameters - combination
@@ -235,7 +235,7 @@ def visualize_similarity(xi):
     plt.title('Token Embedding Similarity Matrix')
     plt.xlabel('Token Index')
     plt.ylabel('Token Index')
-    plt.savefig('token_similarity_heatmap_eu.png', bbox_inches='tight', dpi=300)
+    plt.savefig('token_similarity_heatmap_eu_triton.png', bbox_inches='tight', dpi=300)
     plt.close()
     print("Similarity matrix visualization saved to token_similarity_heatmap_eu.png")
 
@@ -248,7 +248,7 @@ def visualize_similarity(xi):
     plt.title('Token Embedding Similarity Matrix')
     plt.xlabel('Token Index')
     plt.ylabel('Token Index')
-    plt.savefig('token_similarity_heatmap_ct.png', bbox_inches='tight', dpi=300)
+    plt.savefig('token_similarity_heatmap_ct_triton.png', bbox_inches='tight', dpi=300)
     plt.close()
     print("Similarity matrix visualization saved to token_similarity_heatmap_ct.png")
 

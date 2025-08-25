@@ -11,23 +11,9 @@ from torch.utils.data import Dataset, DataLoader
 import networkx as nx
 import torch
 import sys
-from hm_gpt import *
+from hm_gpt_back_copy import *
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-
-# hyperparameters
-batch_size = 64 # how many independent sequences will we process in parallel?
-block_size = 64 # what is the maximum context length for predictions?
-max_iters = 3000
-eval_interval = 500
-learning_rate = 3e-4
-device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-eval_iters = 200
-n_embd = 384
-n_head = 6
-n_layer = 6
-dropout = 0.2
-# ------------
+os.environ["CUDA_VISIBLE_DEVICES"] = "7"
 
 torch.manual_seed(1337)
 
@@ -47,8 +33,9 @@ class CritiGraph(torch.nn.Module):
         self.tp = tp
         self.n = int(2**h)
         self.c = c
-        self.k = int(c*h)
+        # self.k = int(c*h)
         # self.k = 1
+        self.k = int(int(c*h) // 2)
         self.eps = eps
         self.epoch = epoch  
         self.batch_size = batch_size
@@ -92,8 +79,8 @@ class CritiGraph(torch.nn.Module):
             logits_ct = dis_new_pos * mask0 # (B, V, C, D)
             logits_eu = logits[sta_ind].unsqueeze(2).unsqueeze(3).repeat(1, 1, cnc_loc.size(1), self.tp) * mask0 # (B, V, C, D)
             delt = logits_ct - logits_eu
-            # total_loss = (delt * delt).sum(dim=1) / lg[:,None, None]
-            total_loss = torch.abs(delt).sum(dim=1) / lg[:,None, None]
+            total_loss = (delt * delt).sum(dim=1) / lg[:,None, None]
+            # total_loss = torch.abs(delt).sum(dim=1) / lg[:,None, None]
             index = torch.argmin(total_loss, dim=1)
             i_indices, j_indices = torch.meshgrid(torch.arange(sta_ind.size(0)), torch.arange(self.tp), indexing='ij')
             self.locations[sta_ind[i_indices], j_indices] = cnc_loc[i_indices, index[i_indices, j_indices], j_indices]
@@ -148,6 +135,7 @@ class CritiGraph(torch.nn.Module):
         dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
 
         logits = torch.matmul(eu_emb, eu_emb.t()) # (V, V)
+        # print(logits)
 
         for epoch in range(self.epoch):    
             current_time = datetime.now()
@@ -223,7 +211,7 @@ if __name__ == "__main__":
 
     vocab_size = 256
     # h尽可能大，tp在临界值下尽可能大, batch_size在存储限制下尽可能大, L1范数对齐
-    model_CT = CritiGraph(h=27, tp=3, c=1, eps=1e-5, epoch=500, batch_size=256, convergence=0.8, vocab_size=vocab_size)
+    model_CT = CritiGraph(h=27, tp=2, c=1, eps=1e-5, epoch=500, batch_size=256, convergence=0.8, vocab_size=vocab_size)
     model_CT(token_emb)
     torch.save(model_CT.state_dict(), 'gpt_model_CT.pth')
     print("Model saved to gpt_model_CT.pth")
