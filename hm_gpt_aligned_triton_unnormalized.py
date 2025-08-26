@@ -5,43 +5,10 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-from hm_cte_aligned_triton_tct import *
-from hm_para_aligned_triton_tct import *
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
 
-# # hyperparameters - gpt
-# batch_size = 64 # how many independent sequences will we process in parallel?
-# block_size = 256 # what is the maximum context length for predictions?
-# max_iters = 5000
-# eval_interval = 500
-# learning_rate = 3e-4
-# device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-# eval_iters = 10
-# n_embd = 384
-# n_head = 6
-# n_layer = 6
-# dropout = 0.2
-# loss_calc = 1 # 若为 0 则代表 abs, 为 1 则代表 square
-
-# # hyperparameters - cte
-# h=27
-# tp=2
-# c=1 
-# eps=1e-5 
-# epoch_cte=500
-# batch_size_cte=64
-# convergence=0.8
-# # ------------
-
-# torch.manual_seed(1337)
-
-# # wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
-# with open('input.txt', 'r', encoding='utf-8') as f:
-#     text = f.read()
-
-# # here are all the unique characters that occur in this text
-# chars = sorted(list(set(text)))
-# vocab_size = len(chars)
-
+from hm_cte_aligned_triton_unnormalized import *
+from hm_para_aligned_triton_unnormalized import *
 
 # create a mapping from characters to integers
 stoi = { ch:i for i,ch in enumerate(chars) }
@@ -73,6 +40,24 @@ def get_batch(split):
     y = torch.stack([data[i+1:i+block_size+1] for i in ix])
     x, xi, y = x.to(device), xi.to(device), y.to(device)
     return x, xi, y
+
+@torch.no_grad()
+def estimate_loss(model):
+    out = {}
+    model.eval()
+    for split in ['train', 'val']:
+        losses_ori = torch.zeros(eval_iters)
+        losses_cts = torch.zeros(eval_iters)
+        losses_gap = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            X, XI, Y = get_batch(split)
+            _, loss_ori, loss_cts, loss_gap = model(X, XI, targets=Y, evaluation=1)
+            losses_ori[k] = loss_ori.item()
+            losses_cts[k] = loss_cts.item()
+            losses_gap[k] = loss_gap.item()
+        out[split] = [losses_ori.mean(), losses_cts.mean(), losses_gap.mean()]
+    model.train()
+    return out
 
 class Head(nn.Module):
     """ one head of self-attention """
@@ -155,13 +140,17 @@ class GPTLanguageModel(nn.Module):
         self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
         self.ln_f = nn.LayerNorm(n_embd) # final layer norm
 
+        self.region_mask = torch.zeros(block_size+vocab_size, block_size+vocab_size, dtype=torch.long, device=device)
+        self.region_mask[:block_size, :block_size] = 0  # 左上
+        self.region_mask[:block_size, block_size:] = 1  # 右上
+        self.region_mask[block_size:, :block_size] = 1  # 左下（由于对称性，使用右上归一化）
+        self.region_mask[block_size:, block_size:] = 2  # 右下
+
         self.apply(self._init_weights)
-        x = torch.rand((batch_size, block_size + vocab_size, n_embd), device=device)
-        xi = torch.zeros((batch_size, block_size + vocab_size), device=device, dtype=torch.int64)
-        x_norm = torch.zeros((batch_size, block_size + vocab_size, 1), device=device, dtype=torch.float32)
+        x = torch.rand((batch_size, block_size + vocab_size, block_size + vocab_size), device=device)
         self.register_buffer('x', x)
+        xi = torch.rand((batch_size, block_size + vocab_size, block_size + vocab_size), device=device)
         self.register_buffer('xi', xi)
-        self.register_buffer('x_norm', x_norm)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -172,80 +161,66 @@ class GPTLanguageModel(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, idi, targets=None, evaluation=None):
+        st = time.perf_counter()
+        with_cte = False
         B, T = idx.shape
         # idx and targets are both (B,T) tensor of integers
-        tok_emb = self.token_embedding_table(idx) # (B,T,E)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,E)
-        x = tok_emb + pos_emb # (B,T,E)
-        x = self.blocks(x) # (B,T,E)
-        x = self.ln_f(x) # (B,T,E)
-        token_embeddings = self.token_embedding_table.weight  # (V, E)
+        tok_emb = self.token_embedding_table(idx) # (B,T,C)
+        pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,C)
+        x = tok_emb + pos_emb # (B,T,C)
+        x = self.blocks(x) # (B,T,C)
+        x = self.ln_f(x) # (B,T,C)
+        token_embeddings = self.token_embedding_table.weight  # (vocab_size, n_embd)
     
         logits = torch.matmul(x, token_embeddings.t())
 
         if targets is None:
-            total_loss, loss_ori, loss_gap = None, None, None
+            loss_ori, loss_cts, loss_gap = None, None, None
         else:
-            B, T, V = logits.shape
-            logits = logits.view(B*T, V)
+            B, T, C = logits.shape
+            logits = logits.view(B*T, C)
             targets = targets.view(B*T)
             loss_ori = F.cross_entropy(logits, targets)
-            loss_cts = torch.tensor(0.0, device=x.device)
-            loss_gap = torch.tensor(0.0, device=x.device)
             
             if evaluation == 1:
-                x = torch.cat((x, token_embeddings.unsqueeze(0).expand(B, -1, -1)), dim=1) # (B, T, E), (B, V, E) -> (B, T + V, E)
-                x_norm = torch.norm(x, dim=-1, keepdim=True) # (B, T + V, 1)
-                self.x = x
-                self.x_norm = x_norm
-                self.xi = idi
-                # print(self.xi.dtype, self.xi.shape)
-                dismatrix_eu = torch.matmul(x, x.transpose(1, 2)) # (B, T+V, T+V)
-                dismatrix_ct = self.cte(idi, dismatrix_eu.clone().detach(), x_norm.clone().detach()) # (B, T+V, T+V)
-                delt = dismatrix_eu - dismatrix_ct # (B, T+V, T+V)
-                # loss_gap = torch.abs(delt).mean()
-                loss_gap = (delt * delt).mean() # scalar
-                logits_ct = dismatrix_ct[:, :T, T:] # (B, 0:T, 1) @ (B, 1, T:T+V) -> (B, T, V) 
-                # print(logits_ct.shape, B, T, V)
-                logits_ct = logits_ct.reshape(B*T, V)
-                loss_cts = F.cross_entropy(logits_ct, targets)
+                with_cte = True
+                x_norm = torch.cat((x, token_embeddings.unsqueeze(0).expand(B, -1, -1)), dim=1)
+                dismatrix_eu = torch.matmul(x_norm, x_norm.transpose(1, 2))
+                
+                td_eu = torch.abs(dismatrix_eu)
+                max_vals = torch.stack([
+                    td_eu[:, :T, :T].amax(dim=(1, 2), keepdim=True),  # 左上
+                    td_eu[:, :T, T:].amax(dim=(1, 2), keepdim=True),  # 右上
+                    td_eu[:, T:, T:].amax(dim=(1, 2), keepdim=True)   # 右下
+                ], dim=1)
+                selected_max = max_vals[:, self.region_mask]
+                dismatrix_eu = dismatrix_eu / selected_max.squeeze(-1).squeeze(-1)
 
+                self.x = dismatrix_eu
+                dismatrix_ct = self.cte(idi, dismatrix_eu)
+                self.xi = dismatrix_ct
+                logits_ct = dismatrix_ct[:, :T, T:]
+                logits_ct = logits_ct.view(B*T, C)
+                loss_cts = F.cross_entropy(logits_ct, targets)
+                delt = dismatrix_eu - dismatrix_ct
+                # loss_gap = torch.abs(delt).mean()
+                loss_gap = (delt * delt).mean()
+        ed = time.perf_counter()
+        # if with_cte: 
+        #     print(f"Time with cte: {(ed - st) * 1000} ms")
+        
         return logits, loss_ori, loss_cts, loss_gap
 
-
-@torch.no_grad()
-def estimate_loss(model: GPTLanguageModel):
-    out = {}
-    model.eval()
-    for split in ['train', 'val']:
-        losses_ori = torch.zeros(eval_iters)
-        losses_cts = torch.zeros(eval_iters)
-        losses_gap = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, XI, Y = get_batch(split)
-            _, loss_ori, loss_cts, loss_gap = model(X, XI, targets=Y, evaluation=1)
-            losses_ori[k] = loss_ori.item()
-            losses_cts[k] = loss_cts.item()
-            losses_gap[k] = loss_gap.item()
-        out[split] = [losses_ori.mean(), losses_cts.mean(), losses_gap.mean()]
-    model.train()
-    return out
-
-def visualize_similarity():
+def visualize_similarity(xi):
     model = GPTLanguageModel().to(device)
-    model.load_state_dict(torch.load(savename_pth))
+    model.load_state_dict(torch.load('gpt_model_dy_unnormalized.pth'))
     model.eval()
-    print(f"Model loaded from {savename_pth}")
-    emb_eu = model.x[0]
-    # print(model.xi.dtype, model.xi.shape)
-    emb_ct = model.cte.main_locations[model.xi[0]]
-    distance_eu = torch.matmul(emb_eu, emb_eu.transpose(0, 1)).cpu().numpy()
-    distance_ct = model.cte.main_distance(
-        emb_ct.unsqueeze(1), emb_ct.unsqueeze(0), model.x_norm[0]).mean(dim=-1).cpu().numpy()
+    print("Model loaded from gpt_model_dy_unnormalized.pth")
+    distance_eu = model.x[0].cpu().numpy()
+    distance_ct = model.xi[0].cpu().numpy()
     
     Z = linkage(distance_eu, method='ward')
     cluster_order = leaves_list(Z) 
-    
     
     reordered_sim = distance_eu[cluster_order, :][:, cluster_order]
     similarity_matrix = reordered_sim
@@ -256,9 +231,9 @@ def visualize_similarity():
     plt.title('Token Embedding Similarity Matrix')
     plt.xlabel('Token Index')
     plt.ylabel('Token Index')
-    plt.savefig(savename_png_eu, bbox_inches='tight', dpi=300)
+    plt.savefig('token_similarity_heatmap_eu_alinged_triton_unnormalized.png', bbox_inches='tight', dpi=300)
     plt.close()
-    print(f"Similarity matrix visualization saved to {savename_png_eu}")
+    print("Similarity matrix visualization saved to token_similarity_heatmap_eu_unnormalized.png")
 
     reordered_sim = distance_ct[cluster_order, :][:, cluster_order]
     similarity_matrix = reordered_sim
@@ -269,9 +244,9 @@ def visualize_similarity():
     plt.title('Token Embedding Similarity Matrix')
     plt.xlabel('Token Index')
     plt.ylabel('Token Index')
-    plt.savefig(savename_png_ct, bbox_inches='tight', dpi=300)
+    plt.savefig('token_similarity_heatmap_ct_alinged_triton_unnormalized.png', bbox_inches='tight', dpi=300)
     plt.close()
-    print(f"Similarity matrix visualization saved to {savename_png_ct}")
+    print("Similarity matrix visualization saved to token_similarity_heatmap_ct_unnormalized.png")
 
 def train_model():
     model = GPTLanguageModel().to(device)
@@ -283,17 +258,14 @@ def train_model():
             losses = estimate_loss(model)
             print(f"step {iter}: train: ori={losses['train'][0]:.4f}, cts={losses['train'][1]:.4f}, gap={losses['train'][2]:.8f}\
                 | val: ori={losses['val'][0]:.4f}, cts={losses['val'][1]:.4f}, gap={losses['val'][2]:.8f}")
-            torch.save(model.state_dict(), savename_pth)
-            print(f"Model saved to {savename_pth}")
+            torch.save(model.state_dict(), 'gpt_model_dy_unnormalized.pth')
+            print("Model saved to gpt_model_dy_unnormalized.pth")
             visualize_similarity()
-            
-            
         xb, xi, yb = get_batch('train')
-        _, loss, _, _ = model(xb, xi, targets=yb)
+        _, loss, _, _ = model(xb, xi, iter, yb)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
-
 
 if __name__ == "__main__":
     train_model()
