@@ -28,14 +28,14 @@ class CritiGraph(torch.nn.Module):
     main_distance_lookup_table: torch.Tensor
     main_locations: torch.Tensor
     
-    def __init__(self, h, tp, c, eps, epoch, batch_size, convergence, emb_size, blk_size, loss_calc, division_fact):
+    def __init__(self, h, tp, c, eps, epoch, batch_size, convergence, emb_size, blk_size, loss_calc):
         super().__init__() 
         self.h = h
         self.tp = tp
         self.n = int(2**h)
         self.c = c
                                             # 此处是个很重要的改动
-        self.k = int(c*h // division_fact)
+        self.k = int(c*h)
         
         ### ---- 设备/进程信息 ---- ###
         self.devices = [torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())]
@@ -74,18 +74,14 @@ class CritiGraph(torch.nn.Module):
         # _, exp = torch.frexp((xor_result + 1).to(torch.float32))
         # s = exp.float() / self.h
         s = self.distance_lookup_table[dev_num][xor_result]
-        f1 = (torch.floor(torch.log2(torch.abs(coord1).float() + 1)) + 1) / self.h
-        f2 = (torch.floor(torch.log2(torch.abs(coord2).float() + 1)) + 1) / self.h
-        return sg * (1 - s) * f1 * f2
+        return sg * (1 - s)
     
     def main_distance(self, coord1, coord2):
         coord1, coord2 = coord1.clone().cpu(), coord2.clone().cpu()
         sg = 1 - (((coord1 >= 0) ^ (coord2 >= 0)).to(torch.int16) << 1) 
         xor_result = torch.bitwise_xor(torch.abs(coord1), torch.abs(coord2))
         s = self.main_distance_lookup_table[xor_result]
-        f1 = (torch.floor(torch.log2(torch.abs(coord1).float() + 1)) + 1) / self.h
-        f2 = (torch.floor(torch.log2(torch.abs(coord2).float() + 1)) + 1) / self.h
-        return sg * (1 - s) * f1 * f2
+        return sg * (1 - s)
     
     def generate_random_masks(self, sz, dev_num=0):
         upper_bounds = 2**torch.arange(self.h, dtype=torch.int64, device=self.devices[dev_num])
@@ -120,10 +116,10 @@ class CritiGraph(torch.nn.Module):
                 ### 计算：计算开始 ###
                 B = e - s
                 dev_num = i
-                sta_loc = self.locations[i][sta_ind] # (B, T, tp)
+                sta_loc = self.locations[i][sta_ind]
                 
                 lg, mask = self.neighbor_batch(sta_ind, epoch, dev_num=dev_num) # (B, T), (B, T, T)
-                abs_sta_loc = torch.abs(sta_loc.view(-1, self.tp)) # (B * T, tp)
+                abs_sta_loc = torch.abs(sta_loc.view(-1, self.tp))
                 cnc_loc = self.connection(abs_sta_loc, dev_num=dev_num).view(B, self.blk_size, -1, self.tp) #(B, T, C, D)
                 indices = torch.randperm(cnc_loc.size(2), device=dev) 
                 cnc_loc = cnc_loc[:, :, indices, :]
@@ -135,8 +131,11 @@ class CritiGraph(torch.nn.Module):
                     logits=logits,
                     lg=lg,
                     mask=mask,
+                    distance_lookup_table=self.distance_lookup_table[dev_num],
+                    tp=self.tp,
+                    H=self.h,
+                    loss_calc=self.loss_calc
                 )
-                print(f"l: {min_loss.device}", min_loss.dtype, min_loss.shape)
                 tl = min_loss.mean() * B
                 
                 '''原来的 pytorch 逻辑
@@ -248,7 +247,7 @@ class CritiGraph(torch.nn.Module):
         
         ed = time.perf_counter()
         
-        print(f"Time Elapsed: {(ed - st) * 1000.0} ms")
+        # print(f"Time Elapsed: {(ed - st) * 1000.0} ms")
         
         self.main_locations = self.locations[0].clone().cpu()
         return self.distance(self.locations[0][idi].unsqueeze(2), self.locations[0][idi].unsqueeze(1)).mean(dim=-1)

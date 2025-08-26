@@ -5,16 +5,14 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
+os.environ["CUDA_VISIBLE_DEVICES"] = "7"
 
-from hm_cte_aligned_triton import *
-from hm_para_aligned_triton import *
+from hm_cte_aligned_triton_copy import *
 
-'''
 # hyperparameters - gpt
 batch_size = 64 # how many independent sequences will we process in parallel?
 block_size = 256 # what is the maximum context length for predictions?
-max_iters = 5000
+max_iters = 50000
 eval_interval = 100
 learning_rate = 3e-4
 device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
@@ -23,7 +21,6 @@ n_embd = 384
 n_head = 6
 n_layer = 6
 dropout = 0.2
-loss_calc = 1 # 若为 0 则代表 abs, 为 1 则代表 square
 
 # hyperparameters - cte
 h=27
@@ -35,13 +32,11 @@ batch_size_cte=64
 convergence=0.8
 
 # hyperparameters - combination
-ratio_cb = 100
-epoch_threshold = 30
+ratio_cb = 10
+epoch_threshold = 3000
 # ------------
 
 torch.manual_seed(1337)
-
-'''
 
 # wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
 with open('input.txt', 'r', encoding='utf-8') as f:
@@ -175,20 +170,12 @@ class GPTLanguageModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
-        self.cte = CritiGraph(h, tp, c, eps, epoch_cte, batch_size_cte, convergence, text_size + vocab_size, block_size + vocab_size, loss_calc, division_fact)
+        self.cte = CritiGraph(h, tp, c, eps, epoch_cte, batch_size_cte, convergence, text_size + vocab_size, block_size + vocab_size)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
         self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
         self.ln_f = nn.LayerNorm(n_embd) # final layer norm
-
-        self.region_mask = torch.zeros(block_size+vocab_size, block_size+vocab_size, dtype=torch.long, device=device)
-        self.region_mask[:block_size, :block_size] = 0  # 左上
-        self.region_mask[:block_size, block_size:] = 1  # 右上
-        self.region_mask[block_size:, :block_size] = 1  # 左下（由于对称性，使用右上归一化）
-        self.region_mask[block_size:, block_size:] = 2  # 右下
-
         self.apply(self._init_weights)
-        # x = torch.rand((batch_size, block_size + vocab_size, n_embd), device=device)
-        x = torch.rand((batch_size, block_size + vocab_size, block_size + vocab_size), device=device)
+        x = torch.rand((batch_size, block_size + vocab_size, n_embd), device=device)
         self.register_buffer('x', x)
 
     def _init_weights(self, module):
@@ -208,7 +195,6 @@ class GPTLanguageModel(nn.Module):
         x = self.blocks(x) # (B,T,C)
         x = self.ln_f(x) # (B,T,C)
         token_embeddings = self.token_embedding_table.weight  # (vocab_size, n_embd)
-    
         logits = torch.matmul(x, token_embeddings.t())
 
         if targets is None:
@@ -220,24 +206,15 @@ class GPTLanguageModel(nn.Module):
             loss_ori = F.cross_entropy(logits, targets)
             
             if epoch_ct > epoch_threshold:
-                x_norm = torch.cat((x, token_embeddings.unsqueeze(0).expand(B, -1, -1)), dim=1)
-                # self.x = x_norm
-                dismatrix_eu = torch.matmul(x_norm, x_norm.transpose(1, 2))
                 
-                td_eu = torch.abs(dismatrix_eu)
-                max_vals = torch.stack([
-                    td_eu[:, :T, :T].amax(dim=(1, 2), keepdim=True),  # 左上
-                    td_eu[:, :T, T:].amax(dim=(1, 2), keepdim=True),  # 右上
-                    td_eu[:, T:, T:].amax(dim=(1, 2), keepdim=True)   # 右下
-                ], dim=1)
-                selected_max = max_vals[:, self.region_mask]
-                dismatrix_eu = dismatrix_eu / selected_max.squeeze(-1).squeeze(-1)
-
-                self.x = dismatrix_eu
-                dismatrix_ct = self.cte(idi, dismatrix_eu.clone().detach())
+                x = torch.cat((x, token_embeddings.unsqueeze(0).expand(B, -1, -1)), dim=1)
+                
+                x_norm = x / torch.norm(x, dim=-1, keepdim=True)
+                self.x = x_norm
+                dismatrix_eu = torch.matmul(x_norm, x_norm.transpose(1, 2))
+                dismatrix_ct = self.cte(idi, dismatrix_eu)
                 delt = dismatrix_eu - dismatrix_ct
-                # loss_gap = torch.abs(delt).mean()
-                loss_gap = (delt * delt).mean()
+                loss_gap = torch.abs(delt).mean()
             else:
                 loss_gap = torch.tensor(0.0, device=x.device)
             total_loss = loss_ori + ratio_cb * loss_gap
@@ -248,11 +225,10 @@ def visualize_similarity(xi):
     model = GPTLanguageModel().to(device)
     model.load_state_dict(torch.load('gpt_model_dy.pth'))
     model.eval()
-    # print("Model loaded from gpt_model_dy.pth")
+    print("Model loaded from gpt_model_dy.pth")
     emb_eu = model.x[0]
     emb_ct = model.cte.main_locations[xi[0]]
-    # distance_eu = torch.matmul(emb_eu, emb_eu.transpose(0, 1)).cpu().numpy()
-    distance_eu = emb_eu.cpu().numpy()
+    distance_eu = torch.matmul(emb_eu, emb_eu.transpose(0, 1)).cpu().numpy()
     distance_ct = model.cte.main_distance(emb_ct.unsqueeze(1), emb_ct.unsqueeze(0)).mean(dim=-1).cpu().numpy()
     
     Z = linkage(distance_eu, method='ward')
@@ -269,7 +245,7 @@ def visualize_similarity(xi):
     plt.ylabel('Token Index')
     plt.savefig('token_similarity_heatmap_eu_alinged_triton.png', bbox_inches='tight', dpi=300)
     plt.close()
-    # print("Similarity matrix visualization saved to token_similarity_heatmap_eu.png")
+    print("Similarity matrix visualization saved to token_similarity_heatmap_eu.png")
 
     reordered_sim = distance_ct[cluster_order, :][:, cluster_order]
     similarity_matrix = reordered_sim
@@ -282,7 +258,7 @@ def visualize_similarity(xi):
     plt.ylabel('Token Index')
     plt.savefig('token_similarity_heatmap_ct_alinged_triton.png', bbox_inches='tight', dpi=300)
     plt.close()
-    # print("Similarity matrix visualization saved to token_similarity_heatmap_ct.png")
+    print("Similarity matrix visualization saved to token_similarity_heatmap_ct.png")
 
 def train_model():
     model = GPTLanguageModel().to(device)
@@ -301,7 +277,7 @@ def train_model():
         optimizer.step()
         if iter % eval_interval == 0 or iter == max_iters - 1:
             torch.save(model.state_dict(), 'gpt_model_dy.pth')
-            # print("Model saved to gpt_model_dy.pth")
+            print("Model saved to gpt_model_dy.pth")
             if iter > epoch_threshold:
                 visualize_similarity(xi)
 

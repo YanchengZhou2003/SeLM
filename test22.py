@@ -11,7 +11,7 @@ from torch.utils.data import Dataset, DataLoader
 import networkx as nx
 import torch
 import sys
-from hm_gpt_back_copy import *
+from hm_gpt_aligned_triton import *
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "7"
 
@@ -79,8 +79,8 @@ class CritiGraph(torch.nn.Module):
             logits_ct = dis_new_pos * mask0 # (B, V, C, D)
             logits_eu = logits[sta_ind].unsqueeze(2).unsqueeze(3).repeat(1, 1, cnc_loc.size(1), self.tp) * mask0 # (B, V, C, D)
             delt = logits_ct - logits_eu
-            total_loss = (delt * delt).sum(dim=1) / lg[:,None, None]
-            # total_loss = torch.abs(delt).sum(dim=1) / lg[:,None, None]
+            # total_loss = (delt * delt).sum(dim=1) / lg[:,None, None]
+            total_loss = torch.abs(delt).sum(dim=1) / lg[:,None, None]
             index = torch.argmin(total_loss, dim=1)
             i_indices, j_indices = torch.meshgrid(torch.arange(sta_ind.size(0)), torch.arange(self.tp), indexing='ij')
             self.locations[sta_ind[i_indices], j_indices] = cnc_loc[i_indices, index[i_indices, j_indices], j_indices]
@@ -209,9 +209,9 @@ if __name__ == "__main__":
     # 获取token嵌入权重
     token_emb = model.x[0]
 
-    vocab_size = 256
+    vocab_size = 321
     # h尽可能大，tp在临界值下尽可能大, batch_size在存储限制下尽可能大, L1范数对齐
-    model_CT = CritiGraph(h=27, tp=2, c=1, eps=1e-5, epoch=500, batch_size=256, convergence=0.8, vocab_size=vocab_size)
+    model_CT = CritiGraph(h=27, tp=2, c=1, eps=1e-5, epoch=50, batch_size=321, convergence=0.8, vocab_size=vocab_size)
     model_CT(token_emb)
     torch.save(model_CT.state_dict(), 'gpt_model_CT.pth')
     print("Model saved to gpt_model_CT.pth")

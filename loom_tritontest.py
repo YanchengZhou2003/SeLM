@@ -6,15 +6,35 @@ import torch
 import triton
 import triton.language as tl
 
+from hm_para_aligned_triton import *
+
+# @triton.jit
+# def _get_distance_kernel(coord1, coord2, lut_ptr):
+#     # sg = (((coord1 >= 0) << 1) - 1) * (((coord2 >= 0) << 1) - 1)
+#     s1 = (coord1 >= 0).to(tl.int32) * 2 - 1
+#     s2 = (coord2 >= 0).to(tl.int32) * 2 - 1
+#     xorv = tl.abs(coord1) ^ tl.abs(coord2)
+#     # s = tl.load(lut_ptr + xorv.to(tl.int64))
+    
+#     return (s1 * s2).to(s.dtype) * (1.0 - s)
 
 @triton.jit
-def _get_distance_kernel(coord1, coord2, lut_ptr):
-    # sg = (((coord1 >= 0) << 1) - 1) * (((coord2 >= 0) << 1) - 1)
+def _get_distance_kernel(coord1, coord2, H: tl.constexpr):
+    # 符号部分
     s1 = (coord1 >= 0).to(tl.int32) * 2 - 1
     s2 = (coord2 >= 0).to(tl.int32) * 2 - 1
+    sg = (s1 * s2).to(tl.float32)
+
+    # 绝对值 XOR
     xorv = tl.abs(coord1) ^ tl.abs(coord2)
-    s = tl.load(lut_ptr + xorv.to(tl.int64))
-    return (s1 * s2).to(s.dtype) * (1.0 - s)
+
+    # 替换 LUT：log2 计算
+    val = (xorv + 1).to(tl.float32)
+    exp = tl.floor(tl.log2(val)) + 1.0
+    s = exp / H
+
+    return sg * (1.0 - s)
+
 
 
 @triton.jit
@@ -25,14 +45,10 @@ def _loom_kernel(
     logits_ptr,          # fp32  [B,T,T]
     lg_ptr,              # int64 [B,T]
     mask_ptr,            # bool  [B,T,T]
-    lut_ptr,             # fp32  [N]
 
     # out
     sel_ptr,             # int64 [B,T,D]
     loss_b_ptr,          # fp32  [B]  — 原地累加，每(b,t)加上min_{c} loss的D维和
-
-    # sizes
-    B: tl.int32, T: tl.int32, C: tl.int32, D: tl.int32, TP: tl.int32,
 
     # strides (elements)
     sta_sb: tl.int32, sta_st: tl.int32, sta_sd: tl.int32,
@@ -45,7 +61,9 @@ def _loom_kernel(
     # tiling
     BLOCK_T2: tl.constexpr,   # e.g. 64
     BLOCK_C:  tl.constexpr,   # e.g. 64
-    BLOCK_D:  tl.constexpr    # must be >= D; for D=3 set 4 or 8
+    BLOCK_D:  tl.constexpr,   # must be >= D; for D=3 set 4 or 8
+    B: tl.constexpr, T: tl.constexpr, C: tl.constexpr, D: tl.constexpr, TP: tl.constexpr, H: tl.constexpr,
+    loss_calc: tl.constexpr
 ):
     # pdb.set_trace()
     
@@ -93,7 +111,7 @@ def _loom_kernel(
             dis_t_t2_d = _get_distance_kernel(
                 tl.broadcast_to(sta_t[:, None], (BLOCK_D, BLOCK_T2)),
                 sta_t2,
-                lut_ptr
+                H
             )
             # sum over D -> [T2]
             dis_sum_t2 = tl.sum(dis_t_t2_d, axis=0)
@@ -123,7 +141,7 @@ def _loom_kernel(
             sta_bc  = tl.broadcast_to(sta_t2[:, :, None], (BLOCK_D, BLOCK_T2, BLOCK_C))
             cnc_bc  = tl.broadcast_to(cnc_dc[:, None, :], (BLOCK_D, BLOCK_T2, BLOCK_C))
 
-            dist_dtc = _get_distance_kernel(sta_bc, cnc_bc, lut_ptr)
+            dist_dtc = _get_distance_kernel(sta_bc, cnc_bc, H) #, lut_ptr)
 
             dis_pos_bc = tl.broadcast_to(dis_t_t2_d[:, :, None], (BLOCK_D, BLOCK_T2, BLOCK_C))
             dis_sum_bc = tl.broadcast_to(dis_sum_t2[None, :, None], (BLOCK_D, BLOCK_T2, BLOCK_C))
@@ -135,7 +153,10 @@ def _loom_kernel(
 
             # 应用 mask，累加到 part
             delt = tl.where(mask_bc, delt, 0.0)
-            part += tl.sum(tl.abs(delt), axis=1)  # sum over T2
+            if loss_calc == 0:
+                part += tl.sum(tl.abs(delt), axis=1)  # sum over T2
+            else:
+                part += tl.sum(delt * delt, axis=1)
 
 
         # normalize by lg(b,t)
@@ -179,17 +200,16 @@ def triton_loom_wrapper(
     logits:  torch.Tensor,       # fp32  [B,T,T]
     lg:      torch.Tensor,       # int64 [B,T]
     mask:    torch.Tensor,       # bool  [B,T,T]
-    distance_lookup_table: torch.Tensor,  # fp32 [N]
-    tp: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert sta_loc.is_cuda and cnc_loc.is_cuda and logits.is_cuda and lg.is_cuda and mask.is_cuda
-    B, T, D = sta_loc.shape
-    assert D == tp, "D must equal TP for semantic parity"
-    C = cnc_loc.shape[2]
-    # 输出
-    selected_locs = torch.empty((B, T, D), dtype=torch.int64, device=sta_loc.device)
-    loss_b = torch.zeros((B,), dtype=torch.float32, device=sta_loc.device)
+    selected_locs = torch.empty((batch_size, block_size, tp), dtype=torch.int64, device=sta_loc.device)
+    loss_b = torch.zeros((batch_size,), dtype=torch.float32, device=sta_loc.device)
 
+    # print(cnc_loc.shape[2])
+    # assert cnc_loc.shape[2] == 2*h*int(c*h//division_fact)+1
+    
+    # exit(0)
+    
     # strides (in elements)
     sta_sb, sta_st, sta_sd = sta_loc.stride()
     cnc_sb, cnc_st, cnc_sc, cnc_sd = cnc_loc.stride()
@@ -198,20 +218,24 @@ def triton_loom_wrapper(
     msk_sb, msk_st, msk_st2 = mask.stride()
     sel_sb, sel_st, sel_sd = selected_locs.stride()
 
-    grid = (B, T)
+    grid = (batch_size, block_size)
     _loom_kernel[grid](
-        sta_loc, cnc_loc, logits, lg, mask, distance_lookup_table,
+        sta_loc, cnc_loc, logits, lg, mask,
         selected_locs, loss_b,
-        B, T, C, D, tp,
         sta_sb, sta_st, sta_sd,
         cnc_sb, cnc_st, cnc_sc, cnc_sd,
         log_sb, log_st, log_st2,
         lg_sb, lg_st,
         msk_sb, msk_st, msk_st2,
         sel_sb, sel_st, sel_sd,
-        BLOCK_T2=32, BLOCK_C=32, BLOCK_D=2,
-        num_warps=8, num_stages=2
+        BLOCK_T2=64, BLOCK_C=32, BLOCK_D=2,
+        B=batch_size, T=block_size, C=2*h*int(c*h//division_fact)+1, D=tp, TP=tp, H=h,
+        loss_calc=loss_calc,
+        num_warps=8, num_stages=4,
+        
     )
     # 将累加的和变为“平均每(b)的 min 损失”：mean over (T*D)
-    loss_b = loss_b / float(T * D)
+    loss_b = loss_b / float(block_size * tp)
+    # print(f"s: {selected_locs.device}", selected_locs.dtype, selected_locs.shape)
+    # print(f"l: {loss_b.device}", loss_b.dtype, loss_b.shape)
     return selected_locs, loss_b
