@@ -28,14 +28,14 @@ class CritiGraph(torch.nn.Module):
     main_distance_lookup_table: torch.Tensor
     main_locations: torch.Tensor
     
-    def __init__(self, h, tp, c, eps, epoch, batch_size, convergence, emb_size, blk_size, loss_calc):
+    def __init__(self, h, tp, c, eps, epoch, batch_size, convergence, emb_size, blk_size, loss_calc, division_fact):
         super().__init__() 
         self.h = h
         self.tp = tp
         self.n = int(2**h)
         self.c = c
                                             # 此处是个很重要的改动
-        self.k = int(c*h)
+        self.k = int(c*h // division_fact)
         
         ### ---- 设备/进程信息 ---- ###
         self.devices = [torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())]
@@ -64,7 +64,8 @@ class CritiGraph(torch.nn.Module):
         return (torch.floor(torch.log2(xor_results.float() + 1)) + 1) / self.h
     
     # @torch.jit
-    def distance(self, coord1, coord2, dev_num=0):
+    def distance(self, coord1, coord2, x_norm, dev_num=0):
+        # x_norm: (B, T, T)
         # sg = torch.sign(coord1) * torch.sign(coord2)
         sg = (((coord1 >= 0).to(torch.int16) << 1) - 1) * (((coord2 >= 0).to(torch.int16) << 1) - 1)
         # sg = 1 - (((coord1 >= 0) ^ (coord2 >= 0)).to(torch.int16) << 1) 
@@ -74,14 +75,19 @@ class CritiGraph(torch.nn.Module):
         # _, exp = torch.frexp((xor_result + 1).to(torch.float32))
         # s = exp.float() / self.h
         s = self.distance_lookup_table[dev_num][xor_result]
-        return sg * (1 - s)
+        # sg * (1 - s): shape = (B, T, T, D) 或者 (B, T, T, C, D)
+        cosine_similarity = sg * (1 - s)
+        inner_similarity = cosine_similarity * x_norm[..., None] # (B, T, T, ...) * (B, T, T)
+        return inner_similarity
     
-    def main_distance(self, coord1, coord2):
-        coord1, coord2 = coord1.clone().cpu(), coord2.clone().cpu()
-        sg = 1 - (((coord1 >= 0) ^ (coord2 >= 0)).to(torch.int16) << 1) 
+    def main_distance(self, coord1, coord2, x_norm):
+        coord1, coord2, x_norm = coord1.detach().clone().cpu(), coord2.detach().clone().cpu(), x_norm.detach().clone().cpu()
+        sg = (((coord1 >= 0).to(torch.int16) << 1) - 1) * (((coord2 >= 0).to(torch.int16) << 1) - 1)
         xor_result = torch.bitwise_xor(torch.abs(coord1), torch.abs(coord2))
         s = self.main_distance_lookup_table[xor_result]
-        return sg * (1 - s)
+        cosine_similarity = sg * (1 - s)
+        inner_similarity = cosine_similarity * x_norm[..., None] # (B, T, T, ...) * (B, T, T)
+        return inner_similarity
     
     def generate_random_masks(self, sz, dev_num=0):
         upper_bounds = 2**torch.arange(self.h, dtype=torch.int64, device=self.devices[dev_num])
@@ -95,28 +101,29 @@ class CritiGraph(torch.nn.Module):
         return torch.cat((result, ori_int.unsqueeze(1), -result), dim=1) 
     
     @torch.no_grad()
-    def loom(self, epoch, batch: Tuple[torch.Tensor, torch.Tensor],
+    def loom(self, epoch, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
              all_selected_locs: torch.Tensor,
              all_loss: torch.Tensor): # 注：传入张量在 CPU 的 pinned memory 上
         all_B, T = batch[0].shape
         splits = torch.linspace(0, all_B, len(self.devices) + 1, dtype=torch.int64).tolist()
         splits = list(map(int, splits))
         
-        for i, (dev, stream, (s,e)) in enumerate(zip(self.devices, self.streams, zip(splits[:-1], splits[1:]))):
+        for i, (dev, stream, (s, e)) in enumerate(zip(self.devices, self.streams, zip(splits[:-1], splits[1:]))):
             if s == e: continue
 
             # print(f"tring device {dev}")
             with torch.cuda.device(dev), torch.cuda.stream(stream):
                 ### 通信1：数据传输开始 ###        
-                sta_ind, logits = batch[0][s:e], batch[1][s:e]
-                sta_ind, logits = sta_ind.to(dev, non_blocking=True), logits.to(dev, non_blocking=True)
+                sta_ind, logits, x_norm = batch[0][s:e], batch[1][s:e], batch[2][s:e]
+                sta_ind, logits, x_norm = sta_ind.to(dev, non_blocking=True), logits.to(dev, non_blocking=True), x_norm.to(dev, non_blocking=True)
                 ### 通信1：数据传输结束 ###
                 
                 
                 ### 计算：计算开始 ###
                 B = e - s
                 dev_num = i
-                sta_loc = self.locations[i][sta_ind]
+                sta_loc = self.locations[i][sta_ind] # (B, T, tp)
+                x_norm = x_norm.view(B, T, 1) * x_norm.view(B, 1, T) # (B, T, T)
                 
                 lg, mask = self.neighbor_batch(sta_ind, epoch, dev_num=dev_num) # (B, T), (B, T, T)
                 abs_sta_loc = torch.abs(sta_loc.view(-1, self.tp))
@@ -125,25 +132,22 @@ class CritiGraph(torch.nn.Module):
                 cnc_loc = cnc_loc[:, :, indices, :]
                 
                 # 用 Triton 算子替换掉之前的所有计算, 传递所有需要的输入张量
-                selected_locs, min_loss = triton_loom_wrapper(
-                    sta_loc=sta_loc,
-                    cnc_loc=cnc_loc,
-                    logits=logits,
-                    lg=lg,
-                    mask=mask,
-                    distance_lookup_table=self.distance_lookup_table[dev_num],
-                    tp=self.tp,
-                    H=self.h,
-                    loss_calc=self.loss_calc
-                )
-                tl = min_loss.mean() * B
+                # selected_locs, min_loss = triton_loom_wrapper(
+                #     sta_loc=sta_loc,
+                #     cnc_loc=cnc_loc,
+                #     logits=logits,
+                #     x_norm=x_norm,
+                #     lg=lg,
+                #     mask=mask,
+                # )
+                # tl = min_loss.mean() * B
                 
-                '''原来的 pytorch 逻辑
+                # '''原来的 pytorch 逻辑
                 mask0 = mask.unsqueeze(-1).unsqueeze(-1)
-                dis_sta_pos = self.distance(sta_loc[:,:,None,:], sta_loc[:,None,:,:], dev_num=dev_num) # (B, T, T, D)
+                dis_sta_pos = self.distance(sta_loc[:,:,None,:], sta_loc[:,None,:,:], x_norm, dev_num=dev_num) # (B, T, T, D)
                 dis_sta_posum = dis_sta_pos.sum(dim=-1) # (B, T, T)
                 # # -------- Origin --------- #
-                logits_ct = self.distance(sta_loc[:,None,:,None,:], cnc_loc[:,:,None,:,:], dev_num=dev_num) # (B, T, T, C, D)
+                logits_ct = self.distance(sta_loc[:,None,:,None,:], cnc_loc[:,:,None,:,:], x_norm, dev_num=dev_num) # (B, T, T, C, D)
                 logits_ct = (logits_ct-dis_sta_pos[:,:,:,None,:]+dis_sta_posum[:,:,:,None,None]) / self.tp # (B, T, T, C, D)
                 logits_ct = logits_ct * mask0 # (B, T, T, C, D)
                 logits_eu = logits.unsqueeze(3).unsqueeze(4) * mask0 # (B, T, T, C, D)
@@ -155,7 +159,7 @@ class CritiGraph(torch.nn.Module):
                 dim_indices = torch.arange(self.tp, device=dev)[None, None, :]
                 selected_locs = cnc_loc[batch_indices, time_indices, index, dim_indices]
                 tl = total_loss[batch_indices, time_indices, index, dim_indices].mean() * B
-                '''
+                # '''
                 ### 计算：计算结束 ###
                 
                 ### 通信2：数据传输开始 ###
@@ -199,7 +203,10 @@ class CritiGraph(torch.nn.Module):
             batch_mask[tuple(indices.T)] = True
         return batch_lengths, batch_mask   
     
-    def forward(self, idi, dismatrix_eu):
+    def forward(self, idi, dismatrix_eu, x_norm): 
+        # x_norm: (B, T+V, 1)
+        # idi   : (B, T+V)
+        
         st = time.perf_counter()
         
         current_time = datetime.now()
@@ -208,9 +215,11 @@ class CritiGraph(torch.nn.Module):
         # dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
         idi_pinned = torch.empty_like(idi, device='cpu', pin_memory=True, dtype=torch.int64)
         dismatrix_eu_pinned = torch.empty_like(dismatrix_eu, device='cpu', pin_memory=True)
+        x_norm_pinned = torch.empty_like(x_norm, device='cpu', pin_memory=True)
+        
         idi_pinned.copy_(idi)
         dismatrix_eu_pinned.copy_(dismatrix_eu)
-        
+        x_norm_pinned.copy_(x_norm)
         
         all_selected_locs = torch.zeros((idi.shape[0], idi.shape[1], self.tp), dtype=torch.int64, pin_memory=True)
         all_loss = torch.zeros(len(self.devices), dtype=torch.float, pin_memory=True)
@@ -224,11 +233,13 @@ class CritiGraph(torch.nn.Module):
             perm = torch.randperm(idi_pinned.size(0), device='cpu')
             idi_pinned = idi_pinned[perm]
             dismatrix_eu_pinned = dismatrix_eu_pinned[perm]
+            x_norm_pinned = x_norm_pinned[perm]
+            
             # print("current_time:", current_time.strftime("%Y-%m-%d %H:%M:%S.%f"))
             total, ite = 0, 0
             
             # st = time.perf_counter()
-            tot = self.loom(epoch, (idi_pinned, dismatrix_eu_pinned),
+            tot = self.loom(epoch, (idi_pinned, dismatrix_eu_pinned, x_norm_pinned),
                             all_selected_locs,
                             all_loss)
             # if jug == 0 and epoch < epoch_thr:
@@ -250,7 +261,7 @@ class CritiGraph(torch.nn.Module):
         # print(f"Time Elapsed: {(ed - st) * 1000.0} ms")
         
         self.main_locations = self.locations[0].clone().cpu()
-        return self.distance(self.locations[0][idi].unsqueeze(2), self.locations[0][idi].unsqueeze(1)).mean(dim=-1)
+        return self.distance(self.locations[0][idi].unsqueeze(2), self.locations[0][idi].unsqueeze(1), x_norm).mean(dim=-1)
 
 
 if __name__ == "__main__":

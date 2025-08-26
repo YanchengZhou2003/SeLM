@@ -268,7 +268,7 @@ def train_model():
         loss.backward()
         optimizer.step()
         if iter % eval_interval == 0 or iter == max_iters - 1:
-            torch.save(model.state_dict(), 'gpt_model_dy.pth')
+            torch.save(model.state_dict(), savena)
             print("Model saved to gpt_model_dy.pth")
             visualize_similarity(xi)
 

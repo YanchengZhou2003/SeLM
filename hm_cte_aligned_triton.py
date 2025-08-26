@@ -136,7 +136,7 @@ class CritiGraph(torch.nn.Module):
                     lg=lg,
                     mask=mask,
                 )
-                print(f"l: {min_loss.device}", min_loss.dtype, min_loss.shape)
+                # print(f"l: {min_loss.device}", min_loss.dtype, min_loss.shape)
                 tl = min_loss.mean() * B
                 
                 '''原来的 pytorch 逻辑
@@ -201,7 +201,7 @@ class CritiGraph(torch.nn.Module):
         return batch_lengths, batch_mask   
     
     def forward(self, idi, dismatrix_eu):
-        st = time.perf_counter()
+        # st = time.perf_counter()
         
         current_time = datetime.now()
         # print("current_time:", current_time.strftime("%Y-%m-%d %H:%M:%S"))
@@ -244,13 +244,12 @@ class CritiGraph(torch.nn.Module):
             # ed = time.perf_counter()
             # print(f"Time Elapsed: {(ed - st) * 1000} ms")
             
-            # print(epoch, 'average KL divergence:', total)
-        
-        ed = time.perf_counter()
-        
-        print(f"Time Elapsed: {(ed - st) * 1000.0} ms")
+            # print(epoch, 'average loss:', total)
         
         self.main_locations = self.locations[0].clone().cpu()
+        # ed = time.perf_counter()
+        
+        # print(f"Time Elapsed: {(ed - st) * 1000.0} ms")
         return self.distance(self.locations[0][idi].unsqueeze(2), self.locations[0][idi].unsqueeze(1)).mean(dim=-1)
 
 

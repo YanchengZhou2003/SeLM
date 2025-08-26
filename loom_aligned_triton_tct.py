@@ -6,8 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
-from hm_para_aligned_triton import (batch_size, block_size, c, division_fact,
-                                    h, loss_calc, dis_calc, tp, vocab_size)
+from hm_para_aligned_triton_tct import (batch_size, block_size, c, division_fact,
+                                    h, loss_calc, tp, vocab_size)
 
 # @triton.jit
 # def _get_distance_kernel(coord1, coord2, lut_ptr):
@@ -44,6 +44,7 @@ def _loom_kernel(
     sta_loc_ptr,         # int64 [B,T,D]
     cnc_loc_ptr,         # int64 [B,T,C,D]
     logits_ptr,          # fp32  [B,T,T]
+    x_norm_ptr,          # fp32  [B,T,T]
     lg_ptr,              # int64 [B,T]
     mask_ptr,            # bool  [B,T,T]
     
@@ -56,6 +57,7 @@ def _loom_kernel(
     sta_sb: tl.int32, sta_st: tl.int32, sta_sd: tl.int32,
     cnc_sb: tl.int32, cnc_st: tl.int32, cnc_sc: tl.int32, cnc_sd: tl.int32,
     log_sb: tl.int32, log_st: tl.int32, log_st2: tl.int32,
+    x_norm_sb: tl.int32, x_norm_st: tl.int32, x_norm_st2: tl.int32,
     lg_sb:  tl.int32, lg_st:  tl.int32,
     msk_sb: tl.int32, msk_st: tl.int32, msk_st2: tl.int32,
     sel_sb: tl.int32, sel_st: tl.int32, sel_sd: tl.int32,
@@ -109,6 +111,10 @@ def _loom_kernel(
             sta_t2_ptr = sta_loc_ptr + (b * sta_sb + t2_off[None, :] * sta_st + d_off[:, None] * sta_sd)
             sta_t2 = tl.load(sta_t2_ptr, mask=(d_mask[:, None] & t2_mask[None, :]), other=0)
 
+            # load x_norm(b,t,t2) -> (BLOCK_T2,)
+            xnm_ptr = x_norm_ptr + (b * x_norm_sb + t * x_norm_st, t2_off * x_norm_st)
+            xnm_t2 = tl.load(xnm_ptr, mask=t2_mask, other=0.0)
+            
             # dis_sta_pos(b,t,t2,d) = dist(sta_t[d], sta_t2[d])
             dis_t_t2_d = _get_distance_kernel(
                 tl.broadcast_to(sta_t[:, None], (BLOCK_D, BLOCK_T2)),
@@ -117,6 +123,7 @@ def _loom_kernel(
             )
             # sum over D -> [T2]
             dis_sum_t2 = tl.sum(dis_t_t2_d, axis=0)
+            dis_sum_t2 = dis_sum_t2 * xnm_t2
 
             # distance to cnc: dist(sta_t2[d, T2], cnc_dc[d, C])
             # result shape (D, T2, C) but we stream-reduce along T2
@@ -143,7 +150,8 @@ def _loom_kernel(
             sta_bc  = tl.broadcast_to(sta_t2[:, :, None], (BLOCK_D, BLOCK_T2, BLOCK_C))
             cnc_bc  = tl.broadcast_to(cnc_dc[:, None, :], (BLOCK_D, BLOCK_T2, BLOCK_C))
 
-            dist_dtc = _get_distance_kernel(sta_bc, cnc_bc, H) #, lut_ptr)
+            dist_dtc = _get_distance_kernel(sta_bc, cnc_bc, H) # (D, T2, C)
+            dist_dtc = dist_dtc * xnm_t2[None, :, None]
 
             dis_pos_bc = tl.broadcast_to(dis_t_t2_d[:, :, None], (BLOCK_D, BLOCK_T2, BLOCK_C))
             dis_sum_bc = tl.broadcast_to(dis_sum_t2[None, :, None], (BLOCK_D, BLOCK_T2, BLOCK_C))
@@ -200,6 +208,7 @@ def triton_loom_wrapper(
     sta_loc: torch.Tensor,       # int64 [B,T,D]
     cnc_loc: torch.Tensor,       # int64 [B,T,C,D]
     logits:  torch.Tensor,       # fp32  [B,T,T]
+    x_norm:  torch.Tensor,       # fp32  [B,T,T]
     lg:      torch.Tensor,       # int64 [B,T]
     mask:    torch.Tensor,       # bool  [B,T,T]
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -216,19 +225,22 @@ def triton_loom_wrapper(
     
     # strides (in elements)
     sta_sb, sta_st, sta_sd = sta_loc.stride()
+
     cnc_sb, cnc_st, cnc_sc, cnc_sd = cnc_loc.stride()
     log_sb, log_st, log_st2 = logits.stride()
+    x_norm_sb, x_norm_st, x_norm_st2 = x_norm.stride()
     lg_sb, lg_st = lg.stride()
     msk_sb, msk_st, msk_st2 = mask.stride()
     sel_sb, sel_st, sel_sd = selected_locs.stride()
 
     grid = (now_batch_size, block_size+vocab_size)
     _loom_kernel[grid](
-        sta_loc, cnc_loc, logits, lg, mask,
+        sta_loc, cnc_loc, logits, x_norm, lg, mask,
         selected_locs, loss_b,
         sta_sb, sta_st, sta_sd,
         cnc_sb, cnc_st, cnc_sc, cnc_sd,
         log_sb, log_st, log_st2,
+        x_norm_sb, x_norm_st, x_norm_st2,
         lg_sb, lg_st,
         msk_sb, msk_st, msk_st2,
         sel_sb, sel_st, sel_sd,

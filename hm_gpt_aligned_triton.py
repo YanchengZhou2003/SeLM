@@ -43,13 +43,7 @@ torch.manual_seed(1337)
 
 '''
 
-# wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
-with open('input.txt', 'r', encoding='utf-8') as f:
-    text = f.read()
 
-# here are all the unique characters that occur in this text
-chars = sorted(list(set(text)))
-vocab_size = len(chars)
 # create a mapping from characters to integers
 stoi = { ch:i for i,ch in enumerate(chars) }
 itos = { i:ch for i,ch in enumerate(chars) }
@@ -200,6 +194,8 @@ class GPTLanguageModel(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, idi, epoch_ct, targets=None):
+        st = time.perf_counter()
+        with_cte = False
         B, T = idx.shape
         # idx and targets are both (B,T) tensor of integers
         tok_emb = self.token_embedding_table(idx) # (B,T,C)
@@ -220,6 +216,7 @@ class GPTLanguageModel(nn.Module):
             loss_ori = F.cross_entropy(logits, targets)
             
             if epoch_ct > epoch_threshold:
+                with_cte = True
                 x_norm = torch.cat((x, token_embeddings.unsqueeze(0).expand(B, -1, -1)), dim=1)
                 # self.x = x_norm
                 dismatrix_eu = torch.matmul(x_norm, x_norm.transpose(1, 2))
@@ -242,6 +239,10 @@ class GPTLanguageModel(nn.Module):
                 loss_gap = torch.tensor(0.0, device=x.device)
             total_loss = loss_ori + ratio_cb * loss_gap
 
+        ed = time.perf_counter()
+        # if with_cte: 
+        #     print(f"Time with cte: {(ed - st) * 1000} ms")
+        
         return logits, total_loss, loss_ori, loss_gap
 
 def visualize_similarity(xi):

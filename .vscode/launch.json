@@ -2,17 +2,18 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Python: hm_gpt_tritontest",
+      "name": "Python: hm_gpt_aligned_triton",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/hm_gpt_tritontest.py",
+      "program": "${workspaceFolder}/hm_gpt_aligned_triton.py",
       "console": "integratedTerminal",
       "justMyCode": false,
       "env": {
         "TRITON_CODEGEN_DEBUG": "1",
         "TRITON_DUMP_LLVM": "1",
         "TRITON_DUMP_ASM": "1",
-        "TRITON_INTERPRET": "1"
+        "TRITON_INTERPRET": "1",
+        "CUDA_LAUNCH_BLOCKING": "1"
       }
     },
     {
