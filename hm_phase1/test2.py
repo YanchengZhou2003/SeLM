@@ -11,7 +11,7 @@ from torch.utils.data import Dataset, DataLoader
 import networkx as nx
 import torch
 import sys
-from test import *
+from test import GPTLanguageModel
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 

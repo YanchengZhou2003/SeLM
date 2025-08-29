@@ -2,10 +2,10 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Python: hm_gpt_aligned_triton",
+      "name": "Python: GPT",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/hm_gpt_aligned_triton.py",
+      "module": "src.gpt",
       "console": "integratedTerminal",
       "justMyCode": false,
       "env": {
@@ -16,35 +16,5 @@
         "CUDA_LAUNCH_BLOCKING": "1"
       }
     },
-    {
-      "name": "Python: hm_gpt_gt",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/hm_gpt_gt.py",
-      "console": "integratedTerminal",
-      "justMyCode": true,
-      "env": {
-        "ROLE": "gt",
-        "CUDA_VISIBLE_DEVICES": "1"
-      }
-    }
-  ],
-  "compounds": [
-    {
-      "name": "Debug: par + gt (parallel)",
-      "configurations": [
-        "Python: hm_gpt_par",
-        "Python: hm_gpt_gt"
-      ],
-      "stopAll": true
-    },
-    {
-      "name": "Debug: gt -> par (sequential start)",
-      "configurations": [
-        "Python: hm_gpt_gt",
-        "Python: hm_gpt_par"
-      ],
-      "stopAll": true
-    }
   ]
 }
