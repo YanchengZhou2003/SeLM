@@ -77,12 +77,11 @@ class CritiGraph(torch.nn.Module):
         # return sg * (1 - s) * coord1_norm * coord2_norm * 5.
     
     def main_distance(self, coord1: torch.Tensor, coord2: torch.Tensor, norm: torch.Tensor,):
-        # raise NotImplementedError("学长，我还没来得及搞这个")
         coord1, coord2, x_norm = coord1.detach().clone().cpu(), coord2.detach().clone().cpu(), norm.detach().clone().cpu()
         sg = (((coord1 >= 0).to(torch.int16) << 1) - 1) * (((coord2 >= 0).to(torch.int16) << 1) - 1)
         xor_result = torch.bitwise_xor(torch.abs(coord1), torch.abs(coord2))
         s = self.main_distance_lookup_table[xor_result]
-        return sg * (1 - s) * norm
+        return sg * (1 - s) * x_norm
     
     def generate_random_masks(self, sz, dev_num=0):
         upper_bounds = 2**torch.arange(self.h, dtype=torch.int64, device=self.devices[dev_num])
@@ -155,7 +154,8 @@ class CritiGraph(torch.nn.Module):
              # (cB, T1, T2) = (1, V, V)       的时候，表示仅拟合 static  embeddings
              # (cB, T1, T2) = (B, T, V)       的时候，表示仅拟合 probability distribution
              # (cB, T1, T2) = (B+1, T, T+B+V) 的时候，表示三者联合优化
-             mode: str
+             mode: str,
+             train:  bool,
     ):
 
         cB, T1, T2, D = b_val_v.shape[0], b_val_v.shape[1], b_val_v.shape[2], self.tp
@@ -241,13 +241,14 @@ class CritiGraph(torch.nn.Module):
         for i, stream in enumerate(self.streams):
             stream.synchronize()
         
-        ### 更新与计算 ###
-        for i, dev in enumerate(self.devices):
-            self.locations[i].index_copy_(
-                0,                                             # dim=0, 沿行更新
-                b_sta.to(dev, non_blocking=True).view(-1),     # 哪些行
-                all_selected_locs.to(dev, non_blocking=True).view(-1, self.tp)   # 更新的数据
-            )
+        if train:
+            ### 更新与计算 ###
+            for i, dev in enumerate(self.devices):
+                self.locations[i].index_copy_(
+                    0,                                             # dim=0, 沿行更新
+                    b_sta.to(dev, non_blocking=True).view(-1),     # 哪些行
+                    all_selected_locs.to(dev, non_blocking=True).view(-1, self.tp)   # 更新的数据
+                )
         
         return all_avg_loss.sum().item() / cB
 
@@ -266,10 +267,12 @@ class CritiGraph(torch.nn.Module):
             indices = torch.stack([batch_idx, row_idx, col_idx], dim=1)
             valid_mask[mask_1] = False
             valid_mask[tuple(indices.T)] = True
-        return valid_mask # (B, T1, T2)   
-    ''' 
+        return valid_mask # (B, T1, T2)
+    '''
     
-    def neighbor_batch(self, B: int, T1: int, T2: int, epoch: int, dev_num: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
+    '''
+    @timeline(name=f'neighbor_batch 函数主体')
+    def neighbor_batch(self, B: int, T1: int, T2: int, epoch: int, dev_num: int = 0, mark: Optional[Mark]=None) -> Tuple[torch.Tensor, torch.Tensor]:
         device = self.devices[dev_num]
 
         # 收敛时行为
@@ -288,8 +291,40 @@ class CritiGraph(torch.nn.Module):
             valid_mask[b_idx, t1_idx, t2_idx] = True                            # 置为 True
 
         return valid_mask, valid_mask.sum(dim=-1).float()                       # (B, T1, T2), (B, T1)
+    '''
     
-    @timeline(name=f'cte 函数主体')
+
+    # @timeit(name=f'neighbor_batch 函数主体')
+    def neighbor_batch(self, B: int, T1: int, T2: int, epoch: int, dev_num: int = 0, mark: Optional[Mark] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        device = self.devices[dev_num]
+
+        # 收敛期：建议缓存这两个返回，避免每次重分配
+        if epoch > self.convergence * self.epoch:
+            valid_mask = torch.ones((B, T1, T2), dtype=torch.bool, device=device)
+            counts = torch.full((B, T1), T2, dtype=torch.float32, device=device)
+            return valid_mask, counts
+
+        # 80% 行全选；20% 行仅选 1 个
+        choosing_mask = (torch.rand((B, T1), device=device) > 0.2)                 # (B,T1)
+
+        # 为“仅选1个”的行生成 one-hot，不做任何散乱写
+        t2_idx   = torch.randint(T2, (B, T1), device=device)                        # (B,T1)
+        one_hot  = torch.nn.functional.one_hot(t2_idx, num_classes=T2).to(torch.bool)  # (B,T1,T2)
+
+        # 扩展 choosing_mask 并合成最终 mask：选中行→全 True；未选中行→对应 one-hot
+        choosing_mask_3d = choosing_mask.unsqueeze(-1)                              # (B,T1,1)
+        valid_mask = torch.where(choosing_mask_3d, 
+                                torch.ones((B, T1, T2), dtype=torch.bool, device=device),
+                                one_hot)
+
+        # 计数同样用分支消除
+        counts = torch.where(choosing_mask, 
+                            torch.full((B, T1), T2, dtype=torch.float32, device=device),
+                            torch.ones((B, T1), dtype=torch.float32, device=device))
+        return valid_mask, counts
+
+    
+    @timeit(name=f'cte 函数主体')
     def forward(self,        
                 sta     : torch.Tensor, # (B, T+V)     , 代表 每个 sta 样本在 locations 中的 id 
                 pos     : torch.Tensor, # (B, T+V)     , 代表 每个 pos 样本在 locations 中的 id 
@@ -317,13 +352,13 @@ class CritiGraph(torch.nn.Module):
         dyn_loss, sta_loss, prob_loss = 0.0, 0.0, 0.0
         ### 2. 遍历每个 epoch
         for epoch in range(self.epoch): 
-            if epoch < self.epoch * 0.85:  
-                dyn_loss  = self.loom(epoch, sta[:,  :T]    , pos[:,   :T]   , val_v[:,  :T,    :T]    , val_n[:,  :T,    :T]    ,
-                    mode='dyn')
-                sta_loss  = self.loom(epoch, sta[0:1, T:T+V], pos[0:1, T:T+V], val_v[0:1, T:T+V, T:T+V], val_n[0:1, T:T+V, T:T+V],
-                                mode='sta')
-            prob_loss = self.loom(epoch, sta[:,  :T]    , pos[:, T:T+V]  , val_v[:,  :T,   T:T+V]  , val_n[:,  :T,   T:T+V]  ,
-                             mode='prob')
+            # if epoch < self.epoch * 0.85:  
+            dyn_loss  = self.loom(epoch, sta[:,  :T]    , pos[:,   :T]   , val_v[:,  :T,    :T]    , val_n[:,  :T,    :T]    ,
+                mode='dyn' , train=True)
+            # sta_loss  = self.loom(epoch, sta[0:1, T:T+V], pos[0:1, T:T+V], val_v[0:1, T:T+V, T:T+V], val_n[0:1, T:T+V, T:T+V],
+            #     mode='sta' , train=epoch < self.epoch * 0.85)
+            # prob_loss = self.loom(epoch, sta[:,  :T]    , pos[:, T:T+V]  , val_v[:,  :T,   T:T+V]  , val_n[:,  :T,   T:T+V]  ,
+            #     mode='prob', train=True)
             print(f"current epoch: {epoch}, dyn_loss: {fmt6w(dyn_loss)}, sta_loss: {fmt6w(sta_loss)}, prob_loss: {fmt6w(prob_loss)}")
         
         

@@ -134,7 +134,7 @@ class GPTLanguageModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, idi, targets: Optional[torch.Tensor]=None, train_cte=False,
+    def forward(self, idx, idi, targets: torch.Tensor, train_cte=False,
                 visualization=False):
         B, T, V = batch_size, block_size, vocab_size
         # idx and targets are both (B,T) tensor of integers
@@ -146,13 +146,10 @@ class GPTLanguageModel(nn.Module):
         token_embeddings = self.token_embedding_table.weight  # (V, E)
         logits_eu = torch.matmul(x, token_embeddings.t()) # (B, T, V)
 
-        if targets is None:
-            total_loss, loss_eu, loss_gap = None, None, None
-        elif train_cte == False:
-            loss_eu = F.cross_entropy(logits_eu.view(B*T, V), targets.view(B*T))
-            loss_ct = torch.tensor(0.0, device=x.device)
-            loss_gap = torch.tensor(0.0, device=x.device)    
-        elif train_cte == True:
+        loss_ct = torch.tensor(0.0, device=x.device)
+        loss_eu = F.cross_entropy(logits_eu.view(B * T, V), targets.view(B * T))
+        
+        if visualization == True or train_cte == True:
             ### step 1: 计算基本信息
             sta          = idi                                                  # (B, T+V)
             pos          = idi                                                  # (B, T+V)
@@ -168,8 +165,8 @@ class GPTLanguageModel(nn.Module):
             val          = emb_normed @ emb_normed.transpose(1, 2)              # (B, T+V, E) @ (B, E, T+V) -> (B, T+V, T+V)
             logits_norm  = (emb_norm[:, :T, :] *                                #  这一步是为了获得 logits
                             emb_norm.transpose(1, 2)[:, :, T:T+V])              # (B, T, 1) * (B, V, 1) -> (B, T, V)
-            val[:, :T, T:T+V] *= logits_norm                                  # (B, :T, T:T+V) * (B, T, V)
-            # val[:, :T, T:T+V] = to_one_hot_logits(targets, V)
+            # val[:, :T, T:T+V] *= logits_norm                                  # (B, :T, T:T+V) * (B, T, V)
+            val[:, :T, T:T+V] = to_one_hot_logits(targets, V)
             
             #### step 1.3: 直接拿来乘的 Euclidean Norm
             val_norm               = torch.ones_like(val)                       # (B, T+V, T+V)
@@ -184,19 +181,20 @@ class GPTLanguageModel(nn.Module):
             # val_mask[:, T:, :T] = 0                                             # 左下角暂时置为无效区域 
             val_mask = torch.ones_like(val)
             
-            ### step 3: 拟合 cos 相似度与 prob 概率分布
-            logits_ct: torch.Tensor = self.cte(
-                sta, pos     ,  
-                val, val_mask, val_norm,
-                targets=targets
-            )                                                                     # (B, T, V)
-            
-            ### step 4: 计算最终 loss
-            loss_eu = F.cross_entropy(logits_eu.view(B * T, V), targets.view(B * T))
-            loss_ct = F.cross_entropy(logits_ct.view(B * T, V), targets.view(B * T))
+            if train_cte == True:
+                ### step 3: 拟合 cos 相似度与 prob 概率分布
+                logits_ct: torch.Tensor = self.cte(
+                    sta, pos     ,  
+                    val, val_mask, val_norm,
+                    targets=targets
+                )                                                                     # (B, T, V)
+                
+                ### step 4: 计算最终 loss
+                loss_ct = F.cross_entropy(logits_ct.view(B * T, V), targets.view(B * T))
 
         if visualization:
-            return logits_eu, loss_eu, loss_ct, 0, fetch_locals('x', 'idi', 'val_norm')
+            return logits_eu, loss_eu, loss_ct, 0, fetch_locals('val', 'idi', 'emb_normed')
+        
         return logits_eu, loss_eu, loss_ct, 0
 
 @torch.no_grad()
@@ -254,11 +252,12 @@ def train_cte(cktp: str):
     model.eval()
     out = {}
     for iter in range(max_iters):
-        visualize_similarity(model)
         xb, xi, yb = get_batch('train')
-        _, loss_eu, loss_ct, _ = model(xb, xi, targets=yb, train_cte=1)
+        _, loss_eu, loss_ct, _, var = model(xb, xi, targets=yb, train_cte=1, visualization=True)
         print(f"current train iter: {iter}, loss_eu: {fmt6w(loss_eu.item())}, loss_ct: {loss_ct.item()}")
         
+        
+        visualize_similarity(model, var)
         # xb, xi, yb = get_batch('val')
         # _, loss_eu, loss_ct, _ = model(xb, xi, targets=yb, train_cte=1)
         # print(f"current  val  iter: {iter}, loss_eu: {fmt6w(loss_eu.item())}, loss_ct: {loss_ct.item()}")
@@ -266,17 +265,15 @@ def train_cte(cktp: str):
         #     evaluate(model)
     return out
 
-def visualize_similarity(model):
-    xb, xi, yb = get_batch('train')
-    _, _, _, _, var = model(xb, xi, targets=yb, train_cte=0, visualization=True)
-    
-    emb_eu = var['x'][0]
+def visualize_similarity(model, var):
+
+    emb_eu = var['emb_normed'][0][:block_size, :]
     print(emb_eu.dtype, emb_eu.shape)
-    emb_ct = model.cte.main_locations[var['idi'][0].cpu()]
+    emb_ct = model.cte.main_locations[var['idi'][0].cpu()][:block_size, :]
     print(emb_ct.dtype, emb_ct.shape)
     distance_eu = torch.matmul(emb_eu, emb_eu.transpose(0, 1)).cpu().numpy()
     distance_ct = model.cte.main_distance(
-        emb_ct.unsqueeze(1), emb_ct.unsqueeze(0), torch.ones((block_size + vocab_size, block_size + vocab_size, 1))).mean(dim=-1).cpu().numpy()
+        emb_ct.unsqueeze(1), emb_ct.unsqueeze(0), torch.ones((block_size, block_size, 1))).mean(dim=-1).cpu().numpy()
     
     Z = linkage(distance_eu, method='ward')
     cluster_order = leaves_list(Z) 

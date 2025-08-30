@@ -25,7 +25,7 @@ c=1
 eps=1e-5 
 epoch_cte=200
 batch_size_cte=32
-convergence=0.7
+convergence=0.8
 division_fact=4
 
 

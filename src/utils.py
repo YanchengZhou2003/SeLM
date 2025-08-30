@@ -4,13 +4,20 @@ import math
 import time
 from contextlib import ContextDecorator
 from typing import (Any, Callable, Dict, Iterable, List, Literal, Optional,
-                    Sequence, Tuple)
+                    Sequence, Tuple, Union)
 
 import torch
+import matplotlib  
+matplotlib.use("Agg")  # 使用无界面后端，避免在服务器/笔记本上弹窗  
+import matplotlib.pyplot as plt 
+from scipy.cluster.hierarchy import linkage, leaves_list
+from scipy.spatial.distance import squareform, is_valid_y
+import warnings
+import numpy as np
 
 Mark = Callable[[str], None]
-
-def timeline(
+_cache = {}
+def timeit(
     name: Optional[str] = None,
     *,
     unit: Literal["s", "ms", "us"] = "ms",
@@ -408,7 +415,7 @@ def fetch_locals(*names: str) -> Dict[str, Any]:
     """
     frame = inspect.currentframe()
     try:
-        caller = frame.f_back  # 上一层调用者
+        caller = frame.f_back  # type: ignore
         locs = caller.f_locals if caller is not None else {}
         return {name: locs[name] for name in names if name in locs}
     finally:
@@ -479,3 +486,400 @@ def to_one_hot_logits(
     out[b, t, flat_targets] = pos_val
 
     return out
+
+
+def get_cached_tensor(shape, dtype=torch.float32, device:Union[str, torch.device]='cpu', fill_value=None):
+    """
+    获取缓存张量，避免重复分配内存。
+    Args:
+        shape (tuple): 张量形状
+        dtype (torch.dtype): 数据类型
+        device (str or torch.device): 设备
+        fill_value (optional, float/bool/int): 若指定，则填充值
+    Returns:
+        torch.Tensor
+    """
+    key = (shape, dtype, torch.device(device).type)
+
+    if key not in _cache:
+        _cache[key] = torch.empty(shape, dtype=dtype, device=device)
+
+    t = _cache[key]
+
+    if fill_value is not None:
+        t.fill_(fill_value)
+
+    return t
+
+
+def save_heatmap(
+    x: torch.Tensor,
+    path: str = "tmp_heatmap.png",
+    *,
+    vmin: Optional[float] = None, # type: ignore
+    vmax: Optional[float] = None, # type: ignore
+    figsize: Tuple[float, float] = (4.0, 3.6),
+    dpi: int = 200,
+    add_colorbar: bool = True,
+    cmap: str = "viridis",
+    interpolation: str = "nearest",
+    tight: bool = True,
+    nan_color: Optional[Tuple[float, float, float, float]] = None,  # e.g., (1,1,1,0) for transparent
+) -> str:
+    """
+    将 (N, N) 的张量保存为热图图片（不显示）。
+    
+    参数:
+      x: (N, N) 的 torch.Tensor（可在任意设备/类型；内部会转为 CPU float）
+      path: 保存文件名（如 'tmp.png'、'out.jpg' 等）
+      vmin/vmax: 颜色范围；默认自动根据数据取 min/max
+      figsize: 画布尺寸（英寸）
+      dpi: 输出分辨率
+      add_colorbar: 是否添加色条
+      cmap: 颜色映射（默认 viridis，与示例相同风格）
+      interpolation: 图像插值方式（'nearest' 常用于热图）
+      tight: 是否使用紧凑布局
+      nan_color: NaN 的颜色 RGBA；None 表示使用 cmap 默认 NaN 颜色
+
+    返回:
+      保存路径（便于链式使用）
+    """
+    if x.ndim != 2 or x.shape[0] != x.shape[1]:
+        raise ValueError(f"Expected (N, N) tensor, got shape {tuple(x.shape)}")
+
+    # 移到 CPU 并转 float，用于 matplotlib
+    x_np = x.detach().to(torch.float32).cpu().numpy()
+
+    # 设置 colormap（可选自定义 NaN 颜色）
+    cmap_obj = plt.get_cmap(cmap).copy()
+    if nan_color is not None:
+        cmap_obj.set_bad(nan_color)
+
+    # 计算显示范围
+    vmin: float = x_np.min() if vmin is None else float(vmin)
+    vmax: float = x_np.max() if vmax is None else float(vmax)
+    if vmin == vmax:
+        # 避免全常数导致的警告/空白：人为扩一点范围
+        eps = 1e-6 if vmin == 0 else abs(vmin) * 1e-6 + 1e-6
+        vmin -= eps
+        vmax += eps
+
+    # 绘制
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+    im = ax.imshow(x_np, cmap=cmap_obj, vmin=vmin, vmax=vmax, interpolation=interpolation, origin="upper")
+
+    # 可选：添加 colorbar（与示例类似的连续色条）
+    if add_colorbar:
+        cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.ax.tick_params(labelsize=8)
+
+    # 去掉坐标轴刻度线与边框（如需栅格可自行调整）
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    if tight:
+        plt.tight_layout()
+
+    # 保存并清理
+    fig.savefig(path, bbox_inches="tight", dpi=dpi)
+    plt.close(fig)
+    return path
+
+
+def save_hierarchy_heatmap(
+    mat: torch.Tensor,
+    path: str = "tmp_hierarchy.png",
+    *,
+    is_distance: bool = False,
+    linkage_method: Literal[
+        "single", "complete", "average", "weighted",
+        "centroid", "median", "ward"
+    ] = "ward",
+    title: str = "Hierarchical Clustered Matrix",
+    xlabel: str = "Index",
+    ylabel: str = "Index",
+    cmap: str = "viridis",
+    interpolation: str = "nearest",
+    dpi: int = 300,
+    figsize=(8, 8),
+    colorbar_label: Optional[str] = None,
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    reorder_only: bool = True,
+) -> str:
+    """
+    对 (N, N) 张量执行层次化聚类重排并保存热图。
+
+    参数:
+      mat: (N, N) 的相似度或距离矩阵（torch.Tensor，设备/类型不限）
+      path: 保存路径（默认 'tmp_hierarchy.png'）
+      is_distance: True 则输入为距离矩阵；False 则视为相似度并转换成距离
+      linkage_method: scipy.cluster.hierarchy.linkage 的 method，默认 'ward'
+      title/xlabel/ylabel: 图标题与轴标签
+      cmap/interpolation: imshow 的配色与插值
+      dpi/figsize: 图片分辨率与画布大小
+      colorbar_label: 色条标签；None 则自动根据 is_distance 选择
+      vmin/vmax: 颜色范围；默认使用数据 min/max
+      reorder_only: True 表示仅重排并显示原始量（相似度或距离）；
+                    False 表示将相似度转换为距离后也用距离值显示
+
+    返回:
+      保存路径
+    """
+    if mat.ndim != 2 or mat.shape[0] != mat.shape[1]:
+        raise ValueError(f"Expected (N, N) tensor, got shape {tuple(mat.shape)}")
+
+    N = mat.shape[0]
+    # 转 CPU numpy
+    mat_np = mat.detach().to(torch.float32).cpu().numpy()
+
+    # 将相似度转换为距离以用于 linkage
+    if is_distance:
+        D = mat_np.copy()
+        # 对角归零，强制对称
+        np.fill_diagonal(D, 0.0)
+        D = 0.5 * (D + D.T)
+        # 检查是否非负
+        if (D < -1e-7).any():
+            warnings.warn("Distance matrix has negative entries; clipping to 0.")
+            D = np.maximum(D, 0.0)
+    else:
+        S = mat_np
+        # 归一处理可选：很多相似度在 [-1, 1] 或 [0, 1]
+        # 转成距离 d = 1 - s，并裁剪以避免异常
+        D = 1.0 - S
+        D = np.clip(D, 0.0, 2.0)
+        # 对角归零，强制对称
+        np.fill_diagonal(D, 0.0)
+        D = 0.5 * (D + D.T)
+
+    # linkage 需要 condensed 形式（N*(N-1)/2,)
+    # 若已是 condensed，可跳过 squareform 转换，这里做鲁棒处理
+    if is_valid_y(D):
+        y = D  # 已经是 condensed
+    else:
+        y = squareform(D, checks=False)
+
+    # 执行层次化聚类
+    Z = linkage(y, method=linkage_method)
+    order = leaves_list(Z)
+
+    # 重排矩阵供展示
+    if reorder_only:
+        show_mat = mat_np[order][:, order]
+    else:
+        show_mat = D[order][:, order]
+
+    # 颜色范围
+    if vmin is None:
+        vmin = float(np.nanmin(show_mat))
+    if vmax is None:
+        vmax = float(np.nanmax(show_mat))
+    if vmin == vmax:
+        eps = 1e-6 if vmin == 0 else abs(vmin) * 1e-6 + 1e-6
+        vmin -= eps
+        vmax += eps
+
+    # 绘制
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+    im = ax.imshow(show_mat, cmap=cmap, interpolation=interpolation, vmin=vmin, vmax=vmax)
+
+    # 色条
+    if colorbar_label is None:
+        colorbar_label = "distance" if is_distance or not reorder_only else "similarity"
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label(colorbar_label, rotation=270, labelpad=20)
+
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+
+    # 隐藏刻度以获得更干净的矩阵视图
+    # ax.set_xticks([])
+    # ax.set_yticks([])
+    # for spine in ax.spines.values():
+    #     spine.set_visible(False)
+
+    plt.tight_layout()
+    fig.savefig(path, bbox_inches="tight", dpi=dpi)
+    plt.close(fig)
+
+    return path
+
+def compute_indices_and_visual_all(
+    loss_full: torch.Tensor,      # (B, T1, T2, C, tp)
+    loss_reduced: torch.Tensor,   # (B, T1, C, tp) —— loss_full 在 T2 上经 reduce 得到
+    *,
+    reduce: Literal["sum", "mean"] = "mean",  # 仅用于一致性记录（不会重新聚合）
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    计算 argmin 索引以及基于该索引的可视化矩阵（一次性为所有 b, p 生成）。
+
+    返回:
+      indices: (B, T1, tp)
+      visual:  (B, tp, T1, T2)  其中 visual[b, p] 即为 (T1, T2) 可视化矩阵
+    """
+    if loss_full.ndim != 5:
+        raise ValueError(f"loss_full must be (B, T1, T2, C, tp), got {tuple(loss_full.shape)}")
+    if loss_reduced.ndim != 4:
+        raise ValueError(f"loss_reduced must be (B, T1, C, tp), got {tuple(loss_reduced.shape)}")
+
+    B, T1, T2, C, TP = loss_full.shape
+    Br, T1r, Cr, TPr = loss_reduced.shape
+    if not (B == Br and T1 == T1r and C == Cr and TP == TPr):
+        raise ValueError(f"Shape mismatch: full={tuple(loss_full.shape)} reduced={tuple(loss_reduced.shape)}")
+
+    # 1) 在 C 维做 argmin
+    indices = torch.argmin(loss_reduced, dim=2)  # (B, T1, tp)
+
+    # 2) 基于 indices 从 loss_full 中抽取可视化矩阵 V[b,p] = loss_full[b, :, :, indices[b,:,p], p]
+    # 展平 (B, T1, tp) -> (B*tp, T1)，便于一次性 batch gather
+    idx_bp_t1 = indices.permute(0, 2, 1).reshape(B * TP, T1)  # (B*tp, T1)
+
+    # 重排 loss_full 为 (B, tp, T1, T2, C)
+    L = loss_full.permute(0, 4, 1, 2, 3).contiguous()  # (B, tp, T1, T2, C)
+    L = L.reshape(B * TP, T1, T2, C)                   # (B*tp, T1, T2, C)
+
+    # 为每个 (b,p,t1) 提供要选取的 c 索引，扩展到 T2 维度以便 gather
+    gather_idx = idx_bp_t1.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, T2, 1)  # (B*tp, T1, T2, 1)
+
+    # 在最后一维 C 上 gather，得到 (B*tp, T1, T2, 1) -> squeeze -> (B*tp, T1, T2)
+    visual_bp = torch.gather(L, dim=-1, index=gather_idx).squeeze(-1)
+
+    # 还原形状为 (B, tp, T1, T2)
+    visual = visual_bp.view(B, TP, T1, T2)
+
+    return indices, visual
+
+def save_paired_hierarchy_heatmaps(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    path: str = "tmp_pair_hierarchy.png",
+    *,
+    is_distance: bool = False,  # False 表示 A/B 是相似度矩阵，将被转换为距离做聚类
+    linkage_method: Literal[
+        "single", "complete", "average", "weighted",
+        "centroid", "median", "ward"
+    ] = "ward",
+    titles: Tuple[str, str] = ("A (clustered by A)", "B (reordered by A)"),
+    cmap: str = "viridis",
+    interpolation: str = "nearest",
+    figsize: Tuple[float, float] = (10.0, 5.0),
+    dpi: int = 300,
+    vmin_A: Optional[float] = None,
+    vmax_A: Optional[float] = None,
+    vmin_B: Optional[float] = None,
+    vmax_B: Optional[float] = None,
+    colorbar_labels: Tuple[Optional[str], Optional[str]] = (None, None),
+    show_axes: bool = False,
+) -> str:
+    """
+    对 A 做层次化聚类，获得顺序 order；将 A、B 都按该顺序重排后，并排绘制两张热图。
+
+    参数:
+      A, B: (N, N) 张量；B 会用 A 的聚类顺序重排
+      is_distance: 若为 True，则 A、B 被视为距离矩阵；否则视为相似度并转换为距离做聚类
+      linkage_method: linkage 的聚类方法
+      titles: 左右子图标题
+      cmap / interpolation: 颜色与插值
+      figsize / dpi: 图像大小与分辨率
+      vmin_A/vmax_A, vmin_B/vmax_B: 各自的颜色范围；None 表示自动取 min/max
+      colorbar_labels: 左右色条标签；None 则自动推断
+      show_axes: 是否显示坐标轴刻度/边框
+
+    返回:
+      保存路径
+    """
+    # 基本校验
+    if A.ndim != 2 or A.shape[0] != A.shape[1]:
+        raise ValueError(f"A must be square (N,N), got {tuple(A.shape)}")
+    if B.shape != A.shape:
+        raise ValueError(f"B must have same shape as A, got {tuple(B.shape)} vs {tuple(A.shape)}")
+    N = A.shape[0]
+
+    # 转 numpy
+    A_np = A.detach().to(torch.float32).cpu().numpy()
+    B_np = B.detach().to(torch.float32).cpu().numpy()
+
+    # 构造用于聚类的距离矩阵 D_A
+    if is_distance:
+        D_A = A_np.copy()
+        # 对角为 0，强制对称与非负
+        np.fill_diagonal(D_A, 0.0)
+        D_A = 0.5 * (D_A + D_A.T)
+        D_A = np.clip(D_A, 0.0, None)
+    else:
+        # 相似度 -> 距离
+        D_A = 1.0 - A_np
+        D_A = np.clip(D_A, 0.0, 2.0)
+        np.fill_diagonal(D_A, 0.0)
+        D_A = 0.5 * (D_A + D_A.T)
+
+    # linkage 需要 condensed 距离
+    if is_valid_y(D_A):
+        y = D_A
+    else:
+        y = squareform(D_A, checks=False)
+
+    Z = linkage(y, method=linkage_method)
+    order = leaves_list(Z)
+
+    # 重排 A, B 用于显示（注意：显示时仍显示原量，不强制显示距离）
+    A_show = A_np[order][:, order]
+    B_show = B_np[order][:, order]
+
+    # 颜色范围
+    def _range(mat, vmin, vmax):
+        if vmin is None:
+            vmin = float(np.nanmin(mat))
+        if vmax is None:
+            vmax = float(np.nanmax(mat))
+        if vmin == vmax:
+            eps = 1e-6 if vmin == 0 else abs(vmin) * 1e-6 + 1e-6
+            vmin -= eps; vmax += eps
+        return vmin, vmax
+
+    vmin_A, vmax_A = _range(A_show, vmin_A, vmax_A)
+    vmin_B, vmax_B = _range(B_show, vmin_B, vmax_B)
+
+    # 色条标签自动推断
+    label_A = colorbar_labels[0]
+    label_B = colorbar_labels[1]
+    if label_A is None:
+        label_A = "distance" if is_distance else "similarity"
+    if label_B is None:
+        label_B = "distance" if is_distance else "similarity"
+
+    # 绘制左右子图
+    fig, axes = plt.subplots(1, 2, figsize=figsize, dpi=dpi, constrained_layout=True)
+    axL, axR = axes
+
+    imA = axL.imshow(A_show, cmap=cmap, interpolation=interpolation, vmin=vmin_A, vmax=vmax_A)
+    imB = axR.imshow(B_show, cmap=cmap, interpolation=interpolation, vmin=vmin_B, vmax=vmax_B)
+
+    axL.set_title(titles[0])
+    axR.set_title(titles[1])
+
+    # 色条
+    cbarA = plt.colorbar(imA, ax=axL, fraction=0.046, pad=0.04)
+    cbarB = plt.colorbar(imB, ax=axR, fraction=0.046, pad=0.04)
+    cbarA.set_label(label_A, rotation=270, labelpad=16)
+    cbarB.set_label(label_B, rotation=270, labelpad=16)
+
+    # 坐标轴外观
+    if not show_axes:
+        for ax in (axL, axR):
+            ax.set_xticks([]); ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_visible(False)
+    else:
+        axL.set_xlabel("Index (A-order)")
+        axL.set_ylabel("Index (A-order)")
+        axR.set_xlabel("Index (A-order)")
+        axR.set_ylabel("Index (A-order)")
+
+    fig.savefig(path, bbox_inches="tight", dpi=dpi)
+    plt.close(fig)
+    return path
