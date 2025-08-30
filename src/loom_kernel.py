@@ -7,7 +7,7 @@ import triton
 import triton.language as tl
 
 from src.para import (batch_size, block_size, c,
-                                        division_fact, h, loss_calc, tp,
+                                        division_fact, h, tp,
                                         vocab_size)
 
 # @triton.jit

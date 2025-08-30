@@ -2,11 +2,11 @@ import os
 
 import torch
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
+os.environ["CUDA_VISIBLE_DEVICES"] = "7"
 
 # hyperparameters - gpt
-batch_size = 64 # how many independent sequences will we process in parallel?
-block_size = 256 # what is the maximum context length for predictions?
+batch_size = 32 # how many independent sequences will we process in parallel?
+block_size = 128 # what is the maximum context length for predictions?
 max_iters = 10000
 save_interval = 1000
 eval_interval = 1
@@ -23,10 +23,12 @@ h=27
 tp=2
 c=1 
 eps=1e-5 
-epoch_cte=50
-batch_size_cte=63
-convergence=0.8
+epoch_cte=200
+batch_size_cte=32
+convergence=0.7
 division_fact=4
+
+
 loss_type = {
     400: {
         'cos_loss'  : 'square',
@@ -45,8 +47,8 @@ loss_type = {
         }
     } # 400 < epoch <= 500 时使用加权策略
 }
-### cos_loss  可选: 'abs', 'square', 'lap'
-### prob_loss 可选: 'kl' , 'jl'
+### cos_loss  可选: 'abs', 'square'
+### prob_loss 可选: 'kl' , 'js'
 ### method    可选: 
 ##### 'name': 'alternated', 表示交替优化. 不需要额外参数
 ##### 'name': 'weighted'  , 表示加权优化. 需要额外指定 'ratio_cos' 和 'ratio_prob', 且它们加和为 1
@@ -60,9 +62,14 @@ torch.manual_seed(1337)
 with open('./data/input.txt', 'r', encoding='utf-8') as f:
     text = f.read()
 
+
+print(f"数据集总长度：{len(text)}")
+
 # here are all the unique characters that occur in this text
 chars = sorted(list(set(text)))
 vocab_size = len(chars)
 
 # 额外内容
 gpt_path = './ckpt/gpt'
+sim_eu_path = './vis/sim_eu.png'
+sim_ct_path = './vis/sim_ct.png'

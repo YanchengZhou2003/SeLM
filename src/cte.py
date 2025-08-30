@@ -10,8 +10,8 @@ from scipy.cluster.hierarchy import leaves_list, linkage
 from scipy.spatial.distance import pdist
 from torch.nn import functional as F
 
-from src.para import batch_size, block_size, vocab_size
 from src.loom_kernel import triton_loom_wrapper
+from src.para import batch_size, block_size, vocab_size
 from src.utils import *
 
 main_device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
@@ -70,17 +70,19 @@ class CritiGraph(torch.nn.Module):
         # _, exp = torch.frexp((xor_result + 1).to(torch.float32))
         # s = exp.float() / self.h
         s = self.distance_lookup_table[dev_num][xor_result]
+        # coord1_norm = self.distance_lookup_table[dev_num][torch.abs(coord1)]
+        # coord2_norm = self.distance_lookup_table[dev_num][torch.abs(coord2)]
         # sg * (1 - s): shape = (B, T, T, D) 或者 (B, T, T, C, D)
         return sg * (1 - s) * norm
+        # return sg * (1 - s) * coord1_norm * coord2_norm * 5.
     
-    def main_distance(self, coord1, coord2, x_norm):
-        coord1, coord2, x_norm = coord1.detach().clone().cpu(), coord2.detach().clone().cpu(), x_norm.detach().clone().cpu()
+    def main_distance(self, coord1: torch.Tensor, coord2: torch.Tensor, norm: torch.Tensor,):
+        # raise NotImplementedError("学长，我还没来得及搞这个")
+        coord1, coord2, x_norm = coord1.detach().clone().cpu(), coord2.detach().clone().cpu(), norm.detach().clone().cpu()
         sg = (((coord1 >= 0).to(torch.int16) << 1) - 1) * (((coord2 >= 0).to(torch.int16) << 1) - 1)
         xor_result = torch.bitwise_xor(torch.abs(coord1), torch.abs(coord2))
         s = self.main_distance_lookup_table[xor_result]
-        cosine_similarity = sg * (1 - s)
-        inner_similarity = cosine_similarity * x_norm[..., None] # (B, T, T, ...) * (B, T, T)
-        return inner_similarity
+        return sg * (1 - s) * norm
     
     def generate_random_masks(self, sz, dev_num=0):
         upper_bounds = 2**torch.arange(self.h, dtype=torch.int64, device=self.devices[dev_num])
@@ -93,28 +95,32 @@ class CritiGraph(torch.nn.Module):
         result = (flipped_ints.unsqueeze(2) ^ random_masks).view(flipped_ints.size(0), self.h*self.k, self.tp)
         # (B*T1, H, 1, D) ^ (B*T1, H, K, D) -> (B*T1, H*K, D)
         loc = torch.cat((result, ori_int.unsqueeze(1), -result), dim=1) # (B*T1, H*K + 1 + H*K, D)
-        indices = torch.randperm(loc.size(2), device=self.devices[dev_num]) 
-        return loc[:, :, indices, :]
+        indices = torch.randperm(loc.size(1), device=self.devices[dev_num]) 
+        return loc[:, indices, :]
     
     def calc_loss(self, 
                   ct_val : torch.Tensor, eu_val : torch.Tensor, 
                   mask   : torch.Tensor, lth    : torch.Tensor,
-                  epoch  : int = 0     , mode   : str = 'dyn' ,loss_type: Dict = {}
+                  epoch  : int = 0     , mode   : str = 'dyn' , loss_type: Dict = {}
     ) -> torch.Tensor:
         ### ct_val: (B, T1, T2, C, D), eu_val: (B, T1, T2, C, D)
-        ### mask  : (B, T1, T2, 1, 1), lth   : (
+        ### mask  : (B, T1, T2, 1, 1), lth   : (B, T1, 1, 1)
         
         ### step 1: 获取基本信息
         strategy = get_strategy(loss_type, epoch)
         cos_loss_type, prob_loss_type, method = strategy['cos_loss'], strategy['prob_loss'], strategy['method']['name']
-        
         
         ### step 2: 计算 loss
         if mode == 'dyn' or mode == 'sta':
             if cos_loss_type == 'square':
                 loss = torch.square(ct_val - eu_val) # (B, T1, T2, C, tp)
                 loss = loss * mask                   # (B, T1, T2, C, tp)
-        
+                loss = loss.sum(dim=2) / lth         # (B, T1, C, tp)
+            elif cos_loss_type == 'abs':
+                loss = torch.abs(ct_val - eu_val)    # (B, T1, T2, C, tp)
+                loss = loss * mask                   # (B, T1, T2, C, tp)
+                loss = loss.sum(dim=2) / lth         # (B, T1, C, tp)
+            
         if mode == 'prob':
             if prob_loss_type == 'kl':
                 loss = F.kl_div(
@@ -123,13 +129,19 @@ class CritiGraph(torch.nn.Module):
                     log_target=True,
                     reduction='none'
                 ).sum(dim=2)        # (B, T1, T2, C, tp) -> (B, T1, C, tp) 
+            elif prob_loss_type == 'js':
+                loss = js_div(
+                    F.log_softmax(ct_val, dim=2),
+                    F.log_softmax(eu_val, dim=2),
+                    log_target=True,
+                    reduction='none'
+                ).sum(dim=2)        # (B, T1, T2, C, tp) -> (B, T1, C, tp) 
         
         
-        return loss # (B, T+V, C, tp)
+        return loss # (B, T1, C, tp)
         
         
     
-    @timeline(name='loom')
     @torch.no_grad()
     def loom(self, 
              epoch     : int,           #                , 代表当前是第几个 epoch 
@@ -146,9 +158,11 @@ class CritiGraph(torch.nn.Module):
              mode: str
     ):
 
-        cB, T1, T2 = b_val_v.shape[0], b_val_v.shape[1], b_val_v.shape[2]
+        cB, T1, T2, D = b_val_v.shape[0], b_val_v.shape[1], b_val_v.shape[2], self.tp
         splits = torch.linspace(0, cB, len(self.devices) + 1, dtype=torch.int64).tolist()
         splits = list(map(int, splits))
+        all_selected_locs = torch.zeros((cB, T1, self.tp)    , dtype=torch.int64  , pin_memory=True)
+        all_avg_loss      = torch.zeros((len(self.devices), ), dtype=torch.float32, pin_memory=True)
         
         for i, (dev, stream, (s, e)) in enumerate(zip(self.devices, self.streams, zip(splits[:-1], splits[1:]))):
             if s == e: continue
@@ -172,7 +186,6 @@ class CritiGraph(torch.nn.Module):
                     torch.abs(sta_loc.view(-1, self.tp)), 
                     dev_num=dev_num
                 ).view(B, T1, -1, self.tp)       # (B, T1, C, tp)
-                
                 
                 '''
                 # 用 Triton 算子替换掉之前的所有计算, 传递所有需要的输入张量
@@ -203,28 +216,26 @@ class CritiGraph(torch.nn.Module):
                 
                 #### step 3: 计算 loss
                 ct_val    = ct_val                                                                # (B, T1, T2, C, tp)
-                eu_val    = val_v.expand(ct_val.shape)                                            # (B, T1, T2, C, tp)
-                mask, lth = self.neighbor_batch(cB, T1, T2, epoch, dev_num=dev_num)               # (B, T1, T2)
+                eu_val    = val_v[..., None, None].expand(ct_val.shape)                           # (B, T1, T2, C, tp)
+                mask, lth = self.neighbor_batch(B, T1, T2, epoch, dev_num=dev_num,)               # (B, T1, T2)
                 loss      = self.calc_loss(ct_val, eu_val, mask[..., None, None], lth[..., None, None], 
-                                           epoch=epoch, mode=mode, loss_type=self.loss_type)                 # (B, T1, C, D)
+                                           epoch=epoch, mode=mode, loss_type=self.loss_type)      # (B, T1, C, D)
                 
                 
+                #### step 4: 挑选 loss 最小的位置
+                indices       = torch.argmin(loss, dim=2)                                         # (B, T1, D)
+                batch_indices = torch.arange(B,       device=dev)[:, None, None]
+                time_indices  = torch.arange(T1,      device=dev)[None, :, None]
+                dim_indices   = torch.arange(self.tp, device=dev)[None, None, :]
+                selected_locs = cnc_loc[batch_indices, time_indices, indices, dim_indices]        # (B, T1, D)
+                avg_loss      = loss   [batch_indices, time_indices, indices, dim_indices].mean() * B
                 
                 
-                indices = torch.argmin(loss, dim=2) 
-                # total_loss = torch.abs(delt).sum(dim=2) / n_lth[:,:,None, None] # (B, T1, C, D)               
-                # index = torch.argmin(total_loss, dim=2) # (B, T, D)
-                batch_indices = torch.arange(B, device=dev)[:, None, None]
-                time_indices = torch.arange(self.blk_size, device=dev)[None, :, None]
-                dim_indices = torch.arange(self.tp, device=dev)[None, None, :]
-                selected_locs = cnc_loc[batch_indices, time_indices, index, dim_indices]
-                tl = total_loss[batch_indices, time_indices, index, dim_indices].mean() * B
-                # '''
                 ### 计算：计算结束 ###
                 
                 ### 通信2：数据传输开始 ###
                 all_selected_locs[s:e].copy_(selected_locs.to(dtype=torch.int64), non_blocking=True)
-                all_loss[i].copy_(tl, non_blocking=True)
+                all_avg_loss[i].copy_(avg_loss, non_blocking=True)
                 ### 通信2：数据传输结束 ###
         
         for i, stream in enumerate(self.streams):
@@ -234,11 +245,11 @@ class CritiGraph(torch.nn.Module):
         for i, dev in enumerate(self.devices):
             self.locations[i].index_copy_(
                 0,                                             # dim=0, 沿行更新
-                batch[0].to(dev, non_blocking=True).view(-1),     # 哪些行
+                b_sta.to(dev, non_blocking=True).view(-1),     # 哪些行
                 all_selected_locs.to(dev, non_blocking=True).view(-1, self.tp)   # 更新的数据
             )
         
-        return all_loss.sum().item() / all_B
+        return all_avg_loss.sum().item() / cB
 
     '''
     def neighbor_batch(self, B: int, T1: int, T2: int, epoch: int, dev_num=0):
@@ -263,19 +274,20 @@ class CritiGraph(torch.nn.Module):
 
         # 收敛时行为
         if epoch > self.convergence * self.epoch:
-            return torch.ones((B, T1, T2), dtype=torch.bool, device=device)
+            return torch.ones((B, T1, T2), dtype=torch.bool,    device=device), \
+                   torch.full((B, T1)    , dtype=torch.float32, device=device , fill_value=T2)
         
         # 随机时行为
-        choosing_mask = torch.rand((B, T1), device=device) > 0.2              # (B, T1), 有 80% 的位置为 True, 代表全选
-        valid_mask = torch.ones((B, T1, T2), dtype=torch.bool, device=device) # (B, T1, T2), 全部置为 True
-        not_chosen = ~choosing_mask                                           # (B, T1), 有 20% 的位置为 True, 代表只留 1 个邻居
+        choosing_mask = torch.rand((B, T1), device=device) > 0.2                # (B, T1), 有 80% 的位置为 True, 代表全选
+        valid_mask   = torch.ones((B, T1, T2), dtype=torch.bool, device=device) # (B, T1, T2), 全部置为 True
+        not_chosen   = ~choosing_mask                                           # (B, T1), 有 20% 的位置为 True, 代表只留 1 个邻居
         if not_chosen.any():
-            b_idx, t1_idx = torch.where(not_chosen)                           # 找出需要保留 1 个邻居的索引
-            valid_mask[b_idx, t1_idx, :] = False                              # 对应索引的邻居全部置为 0
-            t2_idx = torch.randint(T2, (b_idx.size(0),), device=device)       # 随机一个点
-            valid_mask[b_idx, t1_idx, t2_idx] = True                          # 置为 True
+            b_idx, t1_idx = torch.where(not_chosen)                             # 找出需要保留 1 个邻居的索引
+            valid_mask[b_idx, t1_idx, :] = False                                # 对应索引的邻居全部置为 0
+            t2_idx = torch.randint(T2, (b_idx.size(0),), device=device)         # 随机一个点
+            valid_mask[b_idx, t1_idx, t2_idx] = True                            # 置为 True
 
-        return valid_mask, valid_mask.sum(dim=-1).float()                     # (B, T1, T2)
+        return valid_mask, valid_mask.sum(dim=-1).float()                       # (B, T1, T2), (B, T1)
     
     @timeline(name=f'cte 函数主体')
     def forward(self,        
@@ -285,11 +297,14 @@ class CritiGraph(torch.nn.Module):
                 val_m   : torch.Tensor, # (B, T+V, T+V), 代表 余弦相似度是否有效
                 val_n   : torch.Tensor, # (B, T+V, T+V), 代表 欧式空间的范数乘积，除了 prob 对应的位置之外用 1.0 填充
                 targets: torch.Tensor, mark: Optional[Mark] = None
+                # (0:B, 0:T  , 0:T)   代表着 dynamic embeddings 的内积
+                # (0:B, T:T+V, T:T+V) 代表着 static  embeddings 的内积
+                # (0:B, 0:T  , T:T+V) 代表着 logits, 准备用于概率分布计算
         ): 
-        assert mark is not None # 保证计时器存在
+        # assert mark is not None # 保证计时器存在
         T, V = block_size, vocab_size
         ### 1. 生成用于传输数据的张量
-        mark("pinned 张量生成")
+        # mark("pinned 张量生成")
         pinned = pinned_copy_by_name(
             named(sta=sta, pos=pos, 
                   val_v=val_v, val_m=val_m, val_n=val_n)
@@ -298,26 +313,27 @@ class CritiGraph(torch.nn.Module):
             pinned['sta'], pinned['pos'], 
             pinned['val_v'], pinned['val_m'], pinned['val_n']
         ) 
-        
-        all_selected_locs = torch.zeros((idi.shape[0], idi.shape[1], self.tp), dtype=torch.int64, pin_memory=True)
 
-        
-        for epoch in range(self.epoch):   
-            dyn  = self.loom(epoch, sta[:, :T]   , pos[:,   :T] , val_v[:,  :T,    :T]  , val_n[:,  :T,    :T]  ,
-                             mode='dyn')
-            sta  = self.loom(epoch, sta[0, T:T+V], pos[0, T:T+V], val_v[0, T:T+V, T:T+V], val_n[0, T:T+V, T:T+V],
-                             mode='sta')
-            prob = self.loom(epoch, sta[:, :T]   , pos[:, T:T+V], val_v[:,  :T,   T:T+V], val_n[:,  :T,   T:T+V],
+        dyn_loss, sta_loss, prob_loss = 0.0, 0.0, 0.0
+        ### 2. 遍历每个 epoch
+        for epoch in range(self.epoch): 
+            if epoch < self.epoch * 0.85:  
+                dyn_loss  = self.loom(epoch, sta[:,  :T]    , pos[:,   :T]   , val_v[:,  :T,    :T]    , val_n[:,  :T,    :T]    ,
+                    mode='dyn')
+                sta_loss  = self.loom(epoch, sta[0:1, T:T+V], pos[0:1, T:T+V], val_v[0:1, T:T+V, T:T+V], val_n[0:1, T:T+V, T:T+V],
+                                mode='sta')
+            prob_loss = self.loom(epoch, sta[:,  :T]    , pos[:, T:T+V]  , val_v[:,  :T,   T:T+V]  , val_n[:,  :T,   T:T+V]  ,
                              mode='prob')
+            print(f"current epoch: {epoch}, dyn_loss: {fmt6w(dyn_loss)}, sta_loss: {fmt6w(sta_loss)}, prob_loss: {fmt6w(prob_loss)}")
         
         
 
-        
+        ### 3. 保存并返回 (B, T, V) 的 logits
         self.main_locations = self.locations[0].clone().cpu()
-        # return self.distance(self.locations[0][idi].unsqueeze(2), 
-        #                      self.locations[0][idi].unsqueeze(1), 
-        #                      (x_norm.view(batch_size, block_size + vocab_size, 1) * \
-        #                      x_norm.view(batch_size, 1, block_size + vocab_size)).unsqueeze(-1)).mean(dim=-1)
+        return self.distance(self.locations[0][sta[:, :T].to(self.devices[0])].unsqueeze(2),    # (B, T, 1, tp)
+                             self.locations[0][pos[:, T:T+V].to(self.devices[0])].unsqueeze(1), # (B, 1, V, tp)
+                             val_n[:, :T, T:T+V, None].to(self.devices[0]),                     # (B, T, V, 1)
+                             dev_num=0).mean(dim=-1)                        # (B, T, V)
 
 
 if __name__ == "__main__":

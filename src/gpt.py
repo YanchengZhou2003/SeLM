@@ -18,14 +18,14 @@ decode = lambda l: ''.join([itos[i] for i in l]) # decoder: take a list of integ
 # Train and test splits
 data = torch.tensor(encode(text), dtype=torch.long)
 text_size = len(data)
-datai = torch.tensor(range(text_size), dtype=torch.long)
+datai = torch.tensor([i * block_size for i in range(text_size)], dtype=torch.long)
 n = int(0.9*text_size) # first 90% will be train, rest val
 train_data = data[:n]
 val_data = data[n:]
 train_datai = datai[:n]
 val_datai = datai[n:]
 
-da = (torch.arange(vocab_size)+text_size).unsqueeze(0).expand(batch_size, -1)
+da = (torch.arange(vocab_size) + text_size * block_size).unsqueeze(0).expand(batch_size, -1)
 
 # data loading
 def get_batch(split):
@@ -35,6 +35,9 @@ def get_batch(split):
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([data[i:i+block_size] for i in ix])
     xi = torch.stack([datai[i:i+block_size] for i in ix])
+    xi_pad = torch.arange(0, block_size).unsqueeze(0)
+    xi = xi + xi_pad
+    
     xi = torch.cat((xi, da), dim=1)
     y = torch.stack([data[i+1:i+block_size+1] for i in ix])
     x, xi, y = x.to(device), xi.to(device), y.to(device)
@@ -116,7 +119,7 @@ class GPTLanguageModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
-        self.cte = CritiGraph(h, tp, c, eps, epoch_cte, batch_size_cte, convergence, text_size + vocab_size, block_size + vocab_size, division_fact, loss_type)
+        self.cte = CritiGraph(h, tp, c, eps, epoch_cte, batch_size_cte, convergence, text_size * block_size + vocab_size, block_size + vocab_size, division_fact, loss_type)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
         self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
         self.ln_f = nn.LayerNorm(n_embd) # final layer norm
@@ -131,7 +134,8 @@ class GPTLanguageModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, idi, targets: Optional[torch.Tensor]=None, train_cte=False):
+    def forward(self, idx, idi, targets: Optional[torch.Tensor]=None, train_cte=False,
+                visualization=False):
         B, T, V = batch_size, block_size, vocab_size
         # idx and targets are both (B,T) tensor of integers
         tok_emb = self.token_embedding_table(idx) # (B,T,E)
@@ -140,13 +144,13 @@ class GPTLanguageModel(nn.Module):
         x = self.blocks(x) # (B,T,E)
         x: torch.Tensor = self.ln_f(x) # (B,T,E)
         token_embeddings = self.token_embedding_table.weight  # (V, E)
-        logits = torch.matmul(x, token_embeddings.t()) # (B, T, V)
+        logits_eu = torch.matmul(x, token_embeddings.t()) # (B, T, V)
 
         if targets is None:
-            total_loss, loss_ori, loss_gap = None, None, None
+            total_loss, loss_eu, loss_gap = None, None, None
         elif train_cte == False:
-            loss_ori = F.cross_entropy(logits.view(B*T, V), targets.view(B*T))
-            loss_cts = torch.tensor(0.0, device=x.device)
+            loss_eu = F.cross_entropy(logits_eu.view(B*T, V), targets.view(B*T))
+            loss_ct = torch.tensor(0.0, device=x.device)
             loss_gap = torch.tensor(0.0, device=x.device)    
         elif train_cte == True:
             ### step 1: 计算基本信息
@@ -154,15 +158,18 @@ class GPTLanguageModel(nn.Module):
             pos          = idi                                                  # (B, T+V)
             
             #### step 1.1: 相应的 embeddings (dynamic / static)
-            emb          = torch.cat([x, token_embeddings[None, :, :]], dim=1)  # (B, T+V, E)
-            emb_norm     = torch.norm(emb, dim=-1, keepdim=True)                # (B, T+V, 1)
+            emb          = torch.cat([x, token_embeddings[None, :, :].expand(B, -1, -1)], dim=1)  
+                                                                                # (B, T+V, E)
+            emb_norm     = torch.norm(emb, dim=-1, keepdim=True).clamp_min(1e-12)                
+                                                                                # (B, T+V, 1)
             emb_normed   = emb / emb_norm                                       # (B, T+V, E)
             
             #### step 1.2: 待拟合的 Euclidean Value
             val          = emb_normed @ emb_normed.transpose(1, 2)              # (B, T+V, E) @ (B, E, T+V) -> (B, T+V, T+V)
             logits_norm  = (emb_norm[:, :T, :] *                                #  这一步是为了获得 logits
                             emb_norm.transpose(1, 2)[:, :, T:T+V])              # (B, T, 1) * (B, V, 1) -> (B, T, V)
-            val[:, :T, T:T+V] *= logits_norm                                    # (B, :T, T:T+V) * (B, T, V)
+            val[:, :T, T:T+V] *= logits_norm                                  # (B, :T, T:T+V) * (B, T, V)
+            # val[:, :T, T:T+V] = to_one_hot_logits(targets, V)
             
             #### step 1.3: 直接拿来乘的 Euclidean Norm
             val_norm               = torch.ones_like(val)                       # (B, T+V, T+V)
@@ -178,13 +185,19 @@ class GPTLanguageModel(nn.Module):
             val_mask = torch.ones_like(val)
             
             ### step 3: 拟合 cos 相似度与 prob 概率分布
-            loss_cts = self.cte(
+            logits_ct: torch.Tensor = self.cte(
                 sta, pos     ,  
                 val, val_mask, val_norm,
                 targets=targets
-            ) 
+            )                                                                     # (B, T, V)
+            
+            ### step 4: 计算最终 loss
+            loss_eu = F.cross_entropy(logits_eu.view(B * T, V), targets.view(B * T))
+            loss_ct = F.cross_entropy(logits_ct.view(B * T, V), targets.view(B * T))
 
-        return logits, loss_ori, loss_cts, loss_gap
+        if visualization:
+            return logits_eu, loss_eu, loss_ct, 0, fetch_locals('x', 'idi', 'val_norm')
+        return logits_eu, loss_eu, loss_ct, 0
 
 @torch.no_grad()
 def evaluate(model: GPTLanguageModel):
@@ -210,6 +223,7 @@ def train_gpt():
     # print the number of parameters in the model
     print(sum(p.numel() for p in model.parameters())/1e6, 'M parameters')
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    running_loss = []
     for iter in range(max_iters):
         # if iter % eval_interval == 0 or iter == max_iters - 1:
         #     losses = estimate_loss(model)
@@ -221,38 +235,48 @@ def train_gpt():
         xb, xi, yb = get_batch('train')
         _, loss, _, _ = model(xb, xi, targets=yb)
         optimizer.zero_grad(set_to_none=True)
+        running_loss.append(loss.item())
         loss.backward()
         optimizer.step()
 
-        if iter % save_interval == 0:
+        if iter % save_interval == 0 or iter == max_iters - 1:
+            print(f"current iter: {iter}, avg loss in last {save_interval} iters: {sum(running_loss) / len(running_loss)}")
+            running_loss = []
             torch.save(model.state_dict(), os.path.join(gpt_path, f"iters_{iter}.pth"))
 
 @torch.no_grad()
-def train_cte(model: GPTLanguageModel):
-    out = {}
+def train_cte(cktp: str):
+    model: GPTLanguageModel = GPTLanguageModel().to(device)
+    model_cktp = torch.load(cktp)
+    load_state_dict_skip_prefixes(model, model_cktp, prefixes_to_skip=("cte",), strict=False)
+    model.cte = CritiGraph(h, tp, c, eps, epoch_cte, batch_size_cte, convergence, text_size * block_size + vocab_size, block_size + vocab_size, division_fact, loss_type)
+    
     model.eval()
+    out = {}
     for iter in range(max_iters):
+        visualize_similarity(model)
         xb, xi, yb = get_batch('train')
-        _ = model(xb, xi, targets=yb, evaluation=1)
+        _, loss_eu, loss_ct, _ = model(xb, xi, targets=yb, train_cte=1)
+        print(f"current train iter: {iter}, loss_eu: {fmt6w(loss_eu.item())}, loss_ct: {loss_ct.item()}")
         
-        
-        if iter % eval_interval == 0 or iter == max_iters - 1:
-            evaluate(model)
+        # xb, xi, yb = get_batch('val')
+        # _, loss_eu, loss_ct, _ = model(xb, xi, targets=yb, train_cte=1)
+        # print(f"current  val  iter: {iter}, loss_eu: {fmt6w(loss_eu.item())}, loss_ct: {loss_ct.item()}")
+        # if iter % eval_interval == 0 or iter == max_iters - 1:
+        #     evaluate(model)
     return out
 
-
-
-def visualize_similarity():
-    model = GPTLanguageModel().to(device)
-    model.load_state_dict(torch.load(savename_pth))
-    model.eval()
-    print(f"Model loaded from {savename_pth}")
-    emb_eu = model.x[0]
-    # print(model.xi.dtype, model.xi.shape)
-    emb_ct = model.cte.main_locations[model.xi[0]]
+def visualize_similarity(model):
+    xb, xi, yb = get_batch('train')
+    _, _, _, _, var = model(xb, xi, targets=yb, train_cte=0, visualization=True)
+    
+    emb_eu = var['x'][0]
+    print(emb_eu.dtype, emb_eu.shape)
+    emb_ct = model.cte.main_locations[var['idi'][0].cpu()]
+    print(emb_ct.dtype, emb_ct.shape)
     distance_eu = torch.matmul(emb_eu, emb_eu.transpose(0, 1)).cpu().numpy()
     distance_ct = model.cte.main_distance(
-        emb_ct.unsqueeze(1), emb_ct.unsqueeze(0), model.x_norm[0]).mean(dim=-1).cpu().numpy()
+        emb_ct.unsqueeze(1), emb_ct.unsqueeze(0), torch.ones((block_size + vocab_size, block_size + vocab_size, 1))).mean(dim=-1).cpu().numpy()
     
     Z = linkage(distance_eu, method='ward')
     cluster_order = leaves_list(Z) 
@@ -267,9 +291,9 @@ def visualize_similarity():
     plt.title('Token Embedding Similarity Matrix')
     plt.xlabel('Token Index')
     plt.ylabel('Token Index')
-    plt.savefig(savename_png_eu, bbox_inches='tight', dpi=300)
+    plt.savefig(sim_eu_path, bbox_inches='tight', dpi=300)
     plt.close()
-    print(f"Similarity matrix visualization saved to {savename_png_eu}")
+    print(f"Similarity matrix visualization saved to {sim_eu_path}")
 
     reordered_sim = distance_ct[cluster_order, :][:, cluster_order]
     similarity_matrix = reordered_sim
@@ -280,11 +304,12 @@ def visualize_similarity():
     plt.title('Token Embedding Similarity Matrix')
     plt.xlabel('Token Index')
     plt.ylabel('Token Index')
-    plt.savefig(savename_png_ct, bbox_inches='tight', dpi=300)
+    plt.savefig(sim_ct_path, bbox_inches='tight', dpi=300)
     plt.close()
-    print(f"Similarity matrix visualization saved to {savename_png_ct}")
+    print(f"Similarity matrix visualization saved to {sim_ct_path}")
 
 
 
 if __name__ == "__main__":
-    train_gpt()
+    # train_gpt()
+    train_cte("./ckpt/gpt/iters_4000.pth")
