@@ -27,6 +27,9 @@ val_datai = datai[n:]
 
 da = (torch.arange(vocab_size) + text_size * block_size).unsqueeze(0).expand(batch_size, -1)
 
+# Train Cache
+_train_cache = []
+
 # data loading
 def get_batch(split):
     # generate a small batch of data of inputs x and targets y
@@ -195,7 +198,7 @@ class GPTLanguageModel(nn.Module):
         if visualization:
             return logits_eu, loss_eu, loss_ct, 0, fetch_locals('val', 'idi', 'emb_normed')
         
-        return logits_eu, loss_eu, loss_ct, 0
+        return logits_eu, loss_eu, loss_ct, 0, 0
 
 @torch.no_grad()
 def evaluate(model: GPTLanguageModel):
@@ -223,13 +226,7 @@ def train_gpt():
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     running_loss = []
     for iter in range(max_iters):
-        # if iter % eval_interval == 0 or iter == max_iters - 1:
-        #     losses = estimate_loss(model)
-        #     print(f"step {iter}: train: ori={losses['train'][0]:.4f}, cts={losses['train'][1]:.4f}, gap={losses['train'][2]:.8f}\
-        #         | val: ori={losses['val'][0]:.4f}, cts={losses['val'][1]:.4f}, gap={losses['val'][2]:.8f}")
-        #     torch.save(model.state_dict(), savename_pth)
-        #     print(f"Model saved to {savename_pth}")
-        #     visualize_similarity()            
+        
         xb, xi, yb = get_batch('train')
         _, loss, _, _ = model(xb, xi, targets=yb)
         optimizer.zero_grad(set_to_none=True)
@@ -237,76 +234,153 @@ def train_gpt():
         loss.backward()
         optimizer.step()
 
-        if iter % save_interval == 0 or iter == max_iters - 1:
-            print(f"current iter: {iter}, avg loss in last {save_interval} iters: {sum(running_loss) / len(running_loss)}")
+        if iter % gpt_save_interval == 0 or iter == max_iters - 1:
+            print(f"current iter: {iter}, avg loss in last {gpt_save_interval} iters: {sum(running_loss) / len(running_loss)}")
             running_loss = []
             torch.save(model.state_dict(), os.path.join(gpt_path, f"iters_{iter}.pth"))
 
 @torch.no_grad()
-def train_cte(cktp: str):
+def train_cte(gpt_cktp: str, cte_cktp: str, train_cache_cktp: str):
     model: GPTLanguageModel = GPTLanguageModel().to(device)
-    model_cktp = torch.load(cktp)
+    model_cktp = torch.load(gpt_cktp)
     load_state_dict_skip_prefixes(model, model_cktp, prefixes_to_skip=("cte",), strict=False)
     model.cte = CritiGraph(h, tp, c, eps, epoch_cte, batch_size_cte, convergence, text_size * block_size + vocab_size, block_size + vocab_size, division_fact)
     
     model.eval()
-    out = {}
     for iter in range(max_iters):
+        if iter % cte_save_interval == 0 or iter == max_iters - 1: 
+            visualization = True
+        else:
+            visualization = False
+        
         xb, xi, yb = get_batch('train')
-        _, loss_eu, loss_ct, _, var = model(xb, xi, targets=yb, train_cte=1, visualization=True)
+        _train_cache.append(xb)
+        
+        _, loss_eu, loss_ct, _, var = model(xb, xi, targets=yb, train_cte=1, visualization=visualization)
         print(f"current train iter: {iter}, loss_eu: {fmt6w(loss_eu.item())}, loss_ct: {loss_ct.item()}")
         
-        
-        visualize_similarity(model, var)
-        # xb, xi, yb = get_batch('val')
-        # _, loss_eu, loss_ct, _ = model(xb, xi, targets=yb, train_cte=1)
-        # print(f"current  val  iter: {iter}, loss_eu: {fmt6w(loss_eu.item())}, loss_ct: {loss_ct.item()}")
-        # if iter % eval_interval == 0 or iter == max_iters - 1:
-        #     evaluate(model)
-    return out
+        if visualization:    
+            visualize_similarity(model, var, iter)
+            torch.save(model.cte.state_dict(), cte_cktp.format(iter))
+            torch.save(_train_cache, train_cache_cktp.format(iter))
 
-def visualize_similarity(model, var):
+@torch.no_grad()
+def validate_cte(gpt_cktp: str, cte_cktp: str, train_cache_cktp: str):
+    model: GPTLanguageModel = GPTLanguageModel().to(device)
+    model_cktp = torch.load(gpt_cktp)
+    load_state_dict_skip_prefixes(model, model_cktp, prefixes_to_skip=("cte",), strict=False)
+    model.cte = CritiGraph(h, tp, c, eps, epoch_cte, batch_size_cte, convergence, text_size * block_size + vocab_size, block_size + vocab_size, division_fact)
+    model.cte.load_state_dict(torch.load(cte_cktp))
+    train_cache = torch.load(train_cache_cktp)
+    
+    
 
+
+
+def visualize_similarity(model, var, iter):
     emb_eu = var['emb_normed'][0]
-    # print(emb_eu.dtype, emb_eu.shape)
     emb_ct = model.cte.main_locations[var['idi'][0].cpu()]
-    # print(emb_ct.dtype, emb_ct.shape)
-    distance_eu = torch.matmul(emb_eu, emb_eu.transpose(0, 1)).cpu().numpy()
-    # distance_ct = model.cte.main_distance(
-    #     emb_ct.unsqueeze(1), emb_ct.unsqueeze(0), torch.ones((block_size + vocab_size, block_size + vocab_size, 1))).mean(dim=-1).cpu().numpy()
-    
-    Z = linkage(distance_eu, method='ward')
-    cluster_order = leaves_list(Z) 
-    
-    
-    reordered_sim = distance_eu[cluster_order, :][:, cluster_order]
-    similarity_matrix = reordered_sim
-    plt.figure(figsize=(15, 15))
-    plt.imshow(similarity_matrix, cmap='viridis', interpolation='nearest')
-    cbar = plt.colorbar()
-    cbar.set_label('eu-cosine similarity', rotation=270, labelpad=20)
-    plt.title('Token Embedding Similarity Matrix')
-    plt.xlabel('Token Index')
-    plt.ylabel('Token Index')
-    plt.savefig(sim_eu_path, bbox_inches='tight', dpi=300)
-    plt.close()
-    print(f"Similarity matrix visualization saved to {sim_eu_path}")
 
-    # reordered_sim = distance_ct[cluster_order, :][:, cluster_order]
-    # similarity_matrix = reordered_sim
-    # plt.figure(figsize=(15, 15))
-    # plt.imshow(similarity_matrix, cmap='viridis', interpolation='nearest')
-    # cbar = plt.colorbar()
-    # cbar.set_label('ct-cosine similarity', rotation=270, labelpad=20)
-    # plt.title('Token Embedding Similarity Matrix')
-    # plt.xlabel('Token Index')
-    # plt.ylabel('Token Index')
-    # plt.savefig(sim_ct_path, bbox_inches='tight', dpi=300)
-    # plt.close()
-    # print(f"Similarity matrix visualization saved to {sim_ct_path}")
+    # --- 相似度矩阵 (eu) ---
+    S = torch.matmul(emb_eu, emb_eu.T).cpu().numpy()
+    np.fill_diagonal(S, 1.0)
+
+    # 转为“距离”做聚类
+    D = 1.0 - S
+    np.fill_diagonal(D, 0.0)
+    dvec = squareform(D, checks=False)
+
+    Z = linkage(dvec, method='average')
+    order = leaves_list(Z)
+    S_re = S[order][:, order]
+
+    # --- 一张图：左树 + 热图 + 右色条 (eu) ---
+    fig = plt.figure(figsize=(18, 14))
+    gs = fig.add_gridspec(
+        1, 3,
+        width_ratios=[2.5, 14, 0.5],
+        height_ratios=[1.0],
+        wspace=0.0, hspace=0.0
+    )
+
+    # 左侧行树
+    ax_row = fig.add_subplot(gs[0, 0])
+    dendrogram(Z, ax=ax_row, orientation="right", no_labels=True, color_threshold=None)
+    ax_row.invert_yaxis()
+    ax_row.set_xticks([]); ax_row.set_yticks([])
+
+    # 中间热图 (eu)
+    ax = fig.add_subplot(gs[0, 1])
+    vmin, vmax = S_re.min(), S_re.max()
+    norm = PowerNorm(gamma=2.0, vmin=vmin, vmax=vmax)
+    im = ax.imshow(S_re, cmap="inferno", norm=norm,
+                   interpolation="nearest", aspect="equal")
+    ax.set_xticks([]); ax.set_yticks([])
+    ax.set_title("Hierarchical Cosine Similarity (eu)")
+
+    # 右侧颜色条
+    cax = fig.add_subplot(gs[0, 2])
+    cb = fig.colorbar(im, cax=cax)
+    cb.set_label("eu-cosine similarity", rotation=270, labelpad=25)
+
+    fig.savefig(sim_eu_path.format(iter), dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Similarity + tree visualization saved to {sim_eu_path.format(iter)}")
+
+    # --- 相似度矩阵 (ct) ---
+    distance_ct = model.cte.main_distance(
+        emb_ct.unsqueeze(1), emb_ct.unsqueeze(0),
+        torch.ones((block_size + vocab_size, block_size + vocab_size, 1))
+    ).mean(dim=-1).cpu().numpy()
+    np.fill_diagonal(distance_ct, 1.0)
+    S_ct = distance_ct[order][:, order]
+
+    # --- 一张图：左树 + 热图 + 右色条 (ct) ---
+    fig = plt.figure(figsize=(18, 14))
+    gs = fig.add_gridspec(
+        1, 3,
+        width_ratios=[2.5, 14, 0.5],
+        height_ratios=[1.0],
+        wspace=0.0, hspace=0.0
+    )
+
+    # 左侧行树 (沿用同一个 Z 顺序)
+    ax_row = fig.add_subplot(gs[0, 0])
+    dendrogram(Z, ax=ax_row, orientation="right", no_labels=True, color_threshold=None)
+    ax_row.invert_yaxis()
+    ax_row.set_xticks([]); ax_row.set_yticks([])
+
+    # 中间热图 (ct)
+    ax = fig.add_subplot(gs[0, 1])
+    vmin, vmax = S_ct.min(), S_ct.max()
+    norm = PowerNorm(gamma=2.0, vmin=vmin, vmax=vmax)
+    im = ax.imshow(S_ct, cmap="inferno", norm=norm,
+                   interpolation="nearest", aspect="equal")
+    ax.set_xticks([]); ax.set_yticks([])
+    ax.set_title("Hierarchical Cosine Similarity (ct)")
+
+    # 右侧颜色条
+    cax = fig.add_subplot(gs[0, 2])
+    cb = fig.colorbar(im, cax=cax)
+    cb.set_label("ct-cosine similarity", rotation=270, labelpad=25)
+
+    fig.savefig(sim_ct_path.format(iter), dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Similarity + tree visualization saved to {sim_ct_path.format(iter)}")
+
+
+
+
+
 
 
 
 if __name__ == "__main__":
+    gpt_ckpt = "iters_4000.pth"
+    cte_ckpt = "gpt_iters_4000_cte_iters_{}"
+    train_cache_ckpt = "gpt_iters_4000_cte_iters_{}_train_cache"
+    
     # train_gpt()
-    train_cte("./ckpt/gpt/iters_4000.pth")
+    train_cte(os.path.join(gpt_path, gpt_ckpt),
+              os.path.join(cte_path, cte_ckpt),
+              os.path.join(train_cache_path, train_cache_ckpt))

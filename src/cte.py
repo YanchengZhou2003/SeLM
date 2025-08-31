@@ -6,14 +6,15 @@ from datetime import datetime
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
-from scipy.cluster.hierarchy import leaves_list, linkage
-from scipy.spatial.distance import pdist
+from scipy.cluster.hierarchy import leaves_list, linkage, dendrogram, optimal_leaf_ordering
+from scipy.spatial.distance import pdist, squareform
+from matplotlib.colors import PowerNorm
 from torch.nn import functional as F
 
 from src.loom_kernel import triton_loom_wrapper
+from src.loss import compute_loss
 from src.para import batch_size, block_size, loss_type, vocab_size
 from src.utils import *
-from src.loss import compute_loss
 
 main_device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 from typing import List, Tuple
@@ -147,7 +148,8 @@ class CritiGraph(torch.nn.Module):
              # (cB, T1, T2) = (B+1, T, T+B+V) 的时候，表示三者联合优化
              mode: str,
     ):
-
+        train_mode = self.loss_strategy['target'].startswith(mode)
+        
         cB, T1, T2, D = b_val_v.shape[0], b_val_v.shape[1], b_val_v.shape[2], self.tp
         splits = torch.linspace(0, cB, len(self.devices) + 1, dtype=torch.int64).tolist()
         splits = list(map(int, splits))
@@ -172,11 +174,9 @@ class CritiGraph(torch.nn.Module):
                 #### step 1: 获取基本信息
                 sta_loc = self.locations[i][sta] # (B, T1, tp)
                 pos_loc = self.locations[i][pos] # (B, T2, tp)
-                cnc_loc = self.connection(
-                    torch.abs(sta_loc.view(-1, self.tp)), 
-                    dev_num=dev_num
-                ).view(B, T1, -1, self.tp)       # (B, T1, C, tp)
-                
+                dis_sta_pos     = self.distance(
+                    sta_loc[:, :, None, :]   , pos_loc[:, None, :, :]     , val_n[..., None]      , dev_num=dev_num
+                )               # (B, T1, T2, tp)
                 '''
                 # 用 Triton 算子替换掉之前的所有计算, 传递所有需要的输入张量
                 # selected_locs, min_loss = triton_loom_wrapper(
@@ -189,37 +189,46 @@ class CritiGraph(torch.nn.Module):
                 # )
                 # tl = min_loss.mean() * B
                 '''
-                
-                #### step 2: 获取候选位置（的值）
-                dis_sta_pos     = self.distance(
-                    sta_loc[:, :, None, :]   , pos_loc[:, None, :, :]     , val_n[..., None]      , dev_num=dev_num
-                )            # (B, T1, T2, tp)
-                dis_sta_pos_sum = dis_sta_pos.sum(dim=-1) 
-                             # (B, T1, T2)
-                dis_cnc_pos     = self.distance(
-                    cnc_loc[:, :, None, :, :], pos_loc[:, None, :, None,:], val_n[..., None, None], dev_num=dev_num
-                )            # (B, T1, T2, C, tp)
-                ct_val          = (
-                    dis_sta_pos_sum[:, :, :, None, None] - dis_sta_pos[:, :, :, None, :] + dis_cnc_pos
-                ) / self.tp  #   (B, T1, T2, C, tp)
-                             #    对于 B 个 batch，T1 个 starting point，向 T2 个 positive sample 连边。此时，我们把其中某个 positive sample 替换为 connected sample，共有 C 个；此时，D 个维度上的的距离是多少？
-                
-                #### step 3: 计算 loss
-                ct_val    = ct_val                                                                # (B, T1, T2, C, tp)
-                eu_val    = val_v[..., None, None].expand(ct_val.shape)                           # (B, T1, T2, C, tp)
-                mask, lth = self.neighbor_batch(B, T1, T2, epoch, dev_num=dev_num,)               # (B, T1, T2)
-                loss      = self.calc_loss(ct_val, eu_val, mask[..., None, None], lth[..., None, None], 
-                                           epoch=epoch, mode=mode)      # (B, T1, C, D)
-                
-                
-                #### step 4: 挑选 loss 最小的位置
-                indices       = torch.argmin(loss, dim=2)                                         # (B, T1, D)
-                batch_indices = torch.arange(B,       device=dev)[:, None, None]
-                time_indices  = torch.arange(T1,      device=dev)[None, :, None]
-                dim_indices   = torch.arange(self.tp, device=dev)[None, None, :]
-                selected_locs = cnc_loc[batch_indices, time_indices, indices, dim_indices]        # (B, T1, D)
-                avg_loss      = loss   [batch_indices, time_indices, indices, dim_indices].mean() * B
-                
+                if train_mode:
+                    #### step 2: 获取候选位置（的值）
+                    cnc_loc = self.connection(
+                        torch.abs(sta_loc.view(-1, self.tp)), 
+                        dev_num=dev_num
+                    ).view(B, T1, -1, self.tp)       # (B, T1, C, tp)
+                    dis_sta_pos_sum = dis_sta_pos.sum(dim=-1) 
+                                # (B, T1, T2)
+                    dis_cnc_pos     = self.distance(
+                        cnc_loc[:, :, None, :, :], pos_loc[:, None, :, None,:], val_n[..., None, None], dev_num=dev_num
+                    )            # (B, T1, T2, C, tp)
+                    ct_val          = (
+                        dis_sta_pos_sum[:, :, :, None, None] - dis_sta_pos[:, :, :, None, :] + dis_cnc_pos
+                    ) / self.tp  #   (B, T1, T2, C, tp)
+                                #    对于 B 个 batch，T1 个 starting point，向 T2 个 positive sample 连边。此时，我们把其中某个 positive sample 替换为 connected sample，共有 C 个；此时，D 个维度上的的距离是多少？
+                    
+                    #### step 3: 计算 loss
+                    ct_val    = ct_val                                                                # (B, T1, T2, C, tp)
+                    eu_val    = val_v[..., None, None].expand(ct_val.shape)                           # (B, T1, T2, C, tp)
+                    mask, lth = self.neighbor_batch(B, T1, T2, epoch, dev_num=dev_num,)               # (B, T1, T2)
+                    loss      = self.calc_loss(ct_val, eu_val, mask[..., None, None], lth[..., None, None], 
+                                               epoch=epoch, mode=mode)                                # (B, T1, C, tp)
+                    
+                    
+                    #### step 4: 挑选 loss 最小的位置
+                    indices       = torch.argmin(loss, dim=2)                                         # (B, T1, tp)
+                    batch_indices = torch.arange(B,       device=dev)[:, None, None]
+                    time_indices  = torch.arange(T1,      device=dev)[None, :, None]
+                    dim_indices   = torch.arange(self.tp, device=dev)[None, None, :]
+                    selected_locs = cnc_loc[batch_indices, time_indices, indices, dim_indices]        # (B, T1, tp)
+                    avg_loss      = loss   [batch_indices, time_indices, indices, dim_indices].mean() * B
+                else:
+                    ct_val        = dis_sta_pos.mean(dim=-1)                                          # (B, T1, T2)
+                    eu_val        = val_v                                                             # (B, T1, T2)
+                    mask, lth     = self.neighbor_batch(B, T1, T2, -1, dev_num=dev_num,)        # (B, T1, T2)
+                    loss          = self.calc_loss(ct_val, eu_val, mask, lth, 
+                                                   epoch=epoch, mode=mode)                            # (B, T1)
+                    avg_loss      = loss.mean() * B
+                    selected_locs = torch.empty((B, T1, self.tp), dtype=torch.int64, device=dev)      # (B, T1, tp)
+                                                            
                 
                 ### 计算：计算结束 ###
                 
@@ -231,7 +240,7 @@ class CritiGraph(torch.nn.Module):
         for i, stream in enumerate(self.streams):
             stream.synchronize()
         
-        if self.loss_strategy['target'].startswith(mode):
+        if train_mode:
             ### 更新与计算 ###
             for i, dev in enumerate(self.devices):
                 self.locations[i].index_copy_(
@@ -289,7 +298,7 @@ class CritiGraph(torch.nn.Module):
         device = self.devices[dev_num]
 
         # 收敛期：建议缓存这两个返回，避免每次重分配
-        if self.loss_strategy['converge'] is not None and epoch > self.loss_strategy['converge']:
+        if (self.loss_strategy['converge'] is not None and epoch > self.loss_strategy['converge']) or epoch == -1:
             valid_mask = torch.ones((B, T1, T2), dtype=torch.bool, device=device)
             counts = torch.full((B, T1), T2, dtype=torch.float32, device=device)
             return valid_mask, counts
@@ -314,7 +323,7 @@ class CritiGraph(torch.nn.Module):
         return valid_mask, counts
 
     
-    @timeit(name=f'cte 函数主体')
+    # @timeit(name=f'cte 函数主体')
     def forward(self,        
                 sta     : torch.Tensor, # (B, T+V)     , 代表 每个 sta 样本在 locations 中的 id 
                 pos     : torch.Tensor, # (B, T+V)     , 代表 每个 pos 样本在 locations 中的 id 
@@ -355,7 +364,8 @@ class CritiGraph(torch.nn.Module):
                 mode='sta')
             prob_loss = self.loom(epoch, sta[:,  :T]    , pos[:, T:T+V]  , val_v[:,  :T,   T:T+V]  , val_n[:,  :T,   T:T+V]  ,
                 mode='prob')
-            print(f"current epoch: {epoch}, dyn_loss: {fmt6w(dyn_loss)}, sta_loss: {fmt6w(sta_loss)}, prob_loss: {fmt6w(prob_loss)}")
+            # print(f"current epoch: {epoch}, dyn_loss: {fmt6w(dyn_loss)}, sta_loss: {fmt6w(sta_loss)}, prob_loss: {fmt6w(prob_loss)}")
+        
         
         
 
