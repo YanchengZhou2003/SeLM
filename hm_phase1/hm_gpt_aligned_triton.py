@@ -217,18 +217,12 @@ class GPTLanguageModel(nn.Module):
             
             if epoch_ct > epoch_threshold:
                 with_cte = True
-                x_norm = torch.cat((x, token_embeddings.unsqueeze(0).expand(B, -1, -1)), dim=1)
+                x = torch.cat((x, token_embeddings.unsqueeze(0).expand(B, -1, -1)), dim=1)
                 # self.x = x_norm
-                dismatrix_eu = torch.matmul(x_norm, x_norm.transpose(1, 2))
-                
-                td_eu = torch.abs(dismatrix_eu)
-                max_vals = torch.stack([
-                    td_eu[:, :T, :T].amax(dim=(1, 2), keepdim=True),  # 左上
-                    td_eu[:, :T, T:].amax(dim=(1, 2), keepdim=True),  # 右上
-                    td_eu[:, T:, T:].amax(dim=(1, 2), keepdim=True)   # 右下
-                ], dim=1)
-                selected_max = max_vals[:, self.region_mask]
-                dismatrix_eu = dismatrix_eu / selected_max.squeeze(-1).squeeze(-1)
+                x_norm = torch.norm(x, dim=-1, keepdim=True)
+                x_normed = x / x_norm
+
+                dismatrix_eu = torch.matmul(x_normed, x_normed.transpose(1, 2))
 
                 self.x = dismatrix_eu
                 dismatrix_ct = self.cte(idi, dismatrix_eu.clone().detach())
@@ -268,7 +262,7 @@ def visualize_similarity(xi):
     plt.title('Token Embedding Similarity Matrix')
     plt.xlabel('Token Index')
     plt.ylabel('Token Index')
-    plt.savefig('token_similarity_heatmap_eu_alinged_triton.png', bbox_inches='tight', dpi=300)
+    plt.savefig('0830_token_similarity_heatmap_eu_alinged_triton.png', bbox_inches='tight', dpi=300)
     plt.close()
     # print("Similarity matrix visualization saved to token_similarity_heatmap_eu.png")
 
@@ -281,7 +275,7 @@ def visualize_similarity(xi):
     plt.title('Token Embedding Similarity Matrix')
     plt.xlabel('Token Index')
     plt.ylabel('Token Index')
-    plt.savefig('token_similarity_heatmap_ct_alinged_triton.png', bbox_inches='tight', dpi=300)
+    plt.savefig('0830_token_similarity_heatmap_ct_alinged_triton.png', bbox_inches='tight', dpi=300)
     plt.close()
     # print("Similarity matrix visualization saved to token_similarity_heatmap_ct.png")
 

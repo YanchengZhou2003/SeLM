@@ -7,8 +7,8 @@ from src.utils import LossTypeDict
 os.environ["CUDA_VISIBLE_DEVICES"] = "4,5,6,7"
 
 # hyperparameters - gpt
-batch_size = 32 # how many independent sequences will we process in parallel?
-block_size = 128 # what is the maximum context length for predictions?
+batch_size = 64 # how many independent sequences will we process in parallel?
+block_size = 256 # what is the maximum context length for predictions?
 max_iters = 10000
 save_interval = 1000
 eval_interval = 1

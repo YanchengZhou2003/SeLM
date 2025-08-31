@@ -119,7 +119,7 @@ class GPTLanguageModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
-        self.cte = CritiGraph(h, tp, c, eps, epoch_cte, batch_size_cte, convergence, text_size * block_size + vocab_size, block_size + vocab_size, division_fact, loss_type)
+        self.cte = CritiGraph(h, tp, c, eps, epoch_cte, batch_size_cte, convergence, text_size * block_size + vocab_size, block_size + vocab_size, division_fact)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
         self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
         self.ln_f = nn.LayerNorm(n_embd) # final layer norm
@@ -247,7 +247,7 @@ def train_cte(cktp: str):
     model: GPTLanguageModel = GPTLanguageModel().to(device)
     model_cktp = torch.load(cktp)
     load_state_dict_skip_prefixes(model, model_cktp, prefixes_to_skip=("cte",), strict=False)
-    model.cte = CritiGraph(h, tp, c, eps, epoch_cte, batch_size_cte, convergence, text_size * block_size + vocab_size, block_size + vocab_size, division_fact, loss_type)
+    model.cte = CritiGraph(h, tp, c, eps, epoch_cte, batch_size_cte, convergence, text_size * block_size + vocab_size, block_size + vocab_size, division_fact)
     
     model.eval()
     out = {}
@@ -267,13 +267,13 @@ def train_cte(cktp: str):
 
 def visualize_similarity(model, var):
 
-    emb_eu = var['emb_normed'][0][:block_size, :]
-    print(emb_eu.dtype, emb_eu.shape)
-    emb_ct = model.cte.main_locations[var['idi'][0].cpu()][:block_size, :]
-    print(emb_ct.dtype, emb_ct.shape)
+    emb_eu = var['emb_normed'][0]
+    # print(emb_eu.dtype, emb_eu.shape)
+    emb_ct = model.cte.main_locations[var['idi'][0].cpu()]
+    # print(emb_ct.dtype, emb_ct.shape)
     distance_eu = torch.matmul(emb_eu, emb_eu.transpose(0, 1)).cpu().numpy()
-    distance_ct = model.cte.main_distance(
-        emb_ct.unsqueeze(1), emb_ct.unsqueeze(0), torch.ones((block_size, block_size, 1))).mean(dim=-1).cpu().numpy()
+    # distance_ct = model.cte.main_distance(
+    #     emb_ct.unsqueeze(1), emb_ct.unsqueeze(0), torch.ones((block_size + vocab_size, block_size + vocab_size, 1))).mean(dim=-1).cpu().numpy()
     
     Z = linkage(distance_eu, method='ward')
     cluster_order = leaves_list(Z) 
@@ -292,18 +292,18 @@ def visualize_similarity(model, var):
     plt.close()
     print(f"Similarity matrix visualization saved to {sim_eu_path}")
 
-    reordered_sim = distance_ct[cluster_order, :][:, cluster_order]
-    similarity_matrix = reordered_sim
-    plt.figure(figsize=(15, 15))
-    plt.imshow(similarity_matrix, cmap='viridis', interpolation='nearest')
-    cbar = plt.colorbar()
-    cbar.set_label('ct-cosine similarity', rotation=270, labelpad=20)
-    plt.title('Token Embedding Similarity Matrix')
-    plt.xlabel('Token Index')
-    plt.ylabel('Token Index')
-    plt.savefig(sim_ct_path, bbox_inches='tight', dpi=300)
-    plt.close()
-    print(f"Similarity matrix visualization saved to {sim_ct_path}")
+    # reordered_sim = distance_ct[cluster_order, :][:, cluster_order]
+    # similarity_matrix = reordered_sim
+    # plt.figure(figsize=(15, 15))
+    # plt.imshow(similarity_matrix, cmap='viridis', interpolation='nearest')
+    # cbar = plt.colorbar()
+    # cbar.set_label('ct-cosine similarity', rotation=270, labelpad=20)
+    # plt.title('Token Embedding Similarity Matrix')
+    # plt.xlabel('Token Index')
+    # plt.ylabel('Token Index')
+    # plt.savefig(sim_ct_path, bbox_inches='tight', dpi=300)
+    # plt.close()
+    # print(f"Similarity matrix visualization saved to {sim_ct_path}")
 
 
 

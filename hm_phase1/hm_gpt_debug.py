@@ -4,36 +4,29 @@ from datetime import datetime
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy.cluster.hierarchy import linkage, leaves_list
+from scipy.spatial.distance import pdist
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,3,4,5,6,7"
-
-from hm_cte_back import *
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+# from hm_cte import *
 
 # hyperparameters - gpt
-batch_size = 56 # how many independent sequences will we process in parallel?
+batch_size = 64 # how many independent sequences will we process in parallel?
 block_size = 256 # what is the maximum context length for predictions?
-max_iters = 50000
+max_iters = 5000
 eval_interval = 100
 learning_rate = 3e-4
-device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-eval_iters = 10
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+eval_iters = 200
 n_embd = 384
 n_head = 6
 n_layer = 6
 dropout = 0.2
 
-# hyperparameters - cte
-h=27
-tp=2
-c=1 
-eps=1e-5 
-epoch_cte=50
-batch_size_cte=56
-convergence=0.8
-
 # hyperparameters - combination
-ratio_cb = 10
-epoch_threshold = 300
+ratio = 10
 # ------------
 
 torch.manual_seed(1337)
@@ -53,18 +46,15 @@ decode = lambda l: ''.join([itos[i] for i in l]) # decoder: take a list of integ
 
 # Train and test splits
 data = torch.tensor(encode(text), dtype=torch.long)
-datai = torch.tensor(range(len(data)), dtype=torch.long)
+datai = torch.tensor(range(len(data) - block_size), dtype=torch.long)
 n = int(0.9*len(data)) # first 90% will be train, rest val
 train_data = data[:n]
 val_data = data[n:]
-train_datai = datai[:n]
-val_datai = datai[n:]
 
 # data loading
 def get_batch(split):
     # generate a small batch of data of inputs x and targets y
     data = train_data if split == 'train' else val_data
-    datai = train_datai if split == 'train' else val_datai
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([data[i:i+block_size] for i in ix])
     xi = torch.stack([datai[i:i+block_size] for i in ix])
@@ -73,7 +63,7 @@ def get_batch(split):
     return x, xi, y
 
 @torch.no_grad()
-def estimate_loss(model, epoch):
+def estimate_loss(model):
     out = {}
     model.eval()
     for split in ['train', 'val']:
@@ -82,7 +72,7 @@ def estimate_loss(model, epoch):
         losses_gap = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, XI, Y = get_batch(split)
-            _, total_loss, loss_ori, loss_gap = model(X, XI, epoch, Y)
+            _, total_loss, loss_ori, loss_gap = model(X, XI, Y)
             total_losses[k] = total_loss.item()
             losses_ori[k] = loss_ori.item()
             losses_gap[k] = loss_gap.item()
@@ -166,7 +156,7 @@ class GPTLanguageModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
-        self.cte = CritiGraph(h, tp, c, eps, epoch_cte, batch_size_cte, convergence, len(datai), block_size)
+        # self.cte = CritiGraph(h, tp, c, eps, epoch_cte, batch_size_cte, convergence, len(datai), block_size)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
         self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
         self.ln_f = nn.LayerNorm(n_embd) # final layer norm
@@ -182,7 +172,7 @@ class GPTLanguageModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, idi, epoch_ct, targets=None):
+    def forward(self, idx, idi, targets=None):
         B, T = idx.shape
         # idx and targets are both (B,T) tensor of integers
         tok_emb = self.token_embedding_table(idx) # (B,T,C)
@@ -201,34 +191,26 @@ class GPTLanguageModel(nn.Module):
             targets = targets.view(B*T)
             loss_ori = F.cross_entropy(logits, targets)
             
-            if epoch_ct > epoch_threshold:
-                x_norm = x / torch.norm(x, dim=-1, keepdim=True)
-                self.x = x_norm
-                dismatrix_eu = torch.matmul(x_norm, x_norm.transpose(1, 2))
-                # print(dismatrix_eu)
-                dismatrix_ct = self.cte(idi, dismatrix_eu)
-                delt = dismatrix_eu - dismatrix_ct
-                loss_gap = torch.abs(delt).mean()
-            else:
-                loss_gap = torch.tensor(0.0, device=x.device)
-            total_loss = loss_ori + ratio_cb * loss_gap
+            gap_weight = 10
+            x_norm = x / torch.norm(x, dim=-1, keepdim=True)
+            self.x = x_norm
+            loss_gap = torch.zeros(1, device=device)
+            total_loss = loss_ori
 
         return logits, total_loss, loss_ori, loss_gap
 
-
-def visualize_similarity(xi):
+def visualize_similarity(iter):
     model = GPTLanguageModel().to(device)
-    model.load_state_dict(torch.load('gpt_model_dy.pth'))
+    model.load_state_dict(torch.load('gpt_model_debug.pth'))
     model.eval()
-    print("Model loaded from gpt_model_dy.pth")
+    print("Model loaded from gpt_model_debug.pth")
     # 获取token嵌入权重
     emb_eu = model.x[0]
     # print(emb_eu.size())
-    # print(xi[0])
-    emb_ct = model.cte.main_locations[xi[0]]
+    # emb_ct = model.cte.locations[xi[0]]
     # print(emb_ct.size())
     distance_eu = torch.matmul(emb_eu, emb_eu.transpose(0, 1)).cpu().numpy()
-    distance_ct = model.cte.main_distance(emb_ct.unsqueeze(1), emb_ct.unsqueeze(0)).mean(dim=-1).cpu().numpy()
+    # distance_ct = model.cte.distance(emb_ct.unsqueeze(1), emb_ct.unsqueeze(0)).mean(dim=-1).cpu().numpy()
     
     Z = linkage(distance_eu, method='ward')
     cluster_order = leaves_list(Z) 
@@ -242,22 +224,9 @@ def visualize_similarity(xi):
     plt.title('Token Embedding Similarity Matrix')
     plt.xlabel('Token Index')
     plt.ylabel('Token Index')
-    plt.savefig('debug_token_similarity_heatmap_eu.png', bbox_inches='tight', dpi=300)
+    plt.savefig('token_similarity_heatmap_debug'+str(iter)+'.png', bbox_inches='tight', dpi=300)
     plt.close()
-    print("Similarity matrix visualization saved to token_similarity_heatmap_eu.png")
-
-    reordered_sim = distance_ct[cluster_order, :][:, cluster_order]
-    similarity_matrix = reordered_sim
-    plt.figure(figsize=(15, 15))
-    plt.imshow(similarity_matrix, cmap='viridis', interpolation='nearest')
-    cbar = plt.colorbar()
-    cbar.set_label('ct-cosine similarity', rotation=270, labelpad=20)
-    plt.title('Token Embedding Similarity Matrix')
-    plt.xlabel('Token Index')
-    plt.ylabel('Token Index')
-    plt.savefig('debug_token_similarity_heatmap_ct.png', bbox_inches='tight', dpi=300)
-    plt.close()
-    print("Similarity matrix visualization saved to token_similarity_heatmap_ct.png")
+    print("Similarity matrix visualization saved to token_similarity_heatmap_debug.png")
 
 def train_model():
     model = GPTLanguageModel().to(device)
@@ -266,20 +235,21 @@ def train_model():
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     for iter in range(max_iters):
         if iter % eval_interval == 0 or iter == max_iters - 1:
-            losses = estimate_loss(model, iter)
+            losses = estimate_loss(model)
             print(f"step {iter}: train: total={losses['train'][0]:.4f}, ori={losses['train'][1]:.4f}, gap={losses['train'][2]:.8f}\
                 | val: total={losses['val'][0]:.4f}, ori={losses['val'][1]:.4f}, gap={losses['val'][2]:.8f}")
+            torch.save(model.state_dict(), 'gpt_model_debug.pth')
+            print("Model saved to gpt_model_debug.pth")
+            visualize_similarity(iter)
         xb, xi, yb = get_batch('train')
-        _, loss, _, _ = model(xb, xi, iter, yb)
+        _, loss, _, _ = model(xb, xi, yb)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
-        if iter % eval_interval == 0 or iter == max_iters - 1:
-            torch.save(model.state_dict(), 'gpt_model_dy.pth')
-            print("Model saved to gpt_model_dy.pth")
-            if iter > epoch_threshold:
-                visualize_similarity(xi)
-
+        # if iter % eval_interval == 0 or iter == max_iters - 1:
+            # torch.save(model.state_dict(), 'gpt_model_debug.pth')
+            # print("Model saved to gpt_model_debug.pth")
+            # visualize_similarity(iter)
 
 if __name__ == "__main__":
     train_model()

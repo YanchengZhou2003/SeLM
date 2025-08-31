@@ -11,8 +11,9 @@ from scipy.spatial.distance import pdist
 from torch.nn import functional as F
 
 from src.loom_kernel import triton_loom_wrapper
-from src.para import batch_size, block_size, vocab_size
+from src.para import batch_size, block_size, loss_type, vocab_size
 from src.utils import *
+from src.loss import compute_loss
 
 main_device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 from typing import List, Tuple
@@ -25,7 +26,7 @@ class CritiGraph(torch.nn.Module):
     main_distance_lookup_table: torch.Tensor
     main_locations: torch.Tensor
     
-    def __init__(self, h, tp, c, eps, epoch, batch_size, convergence, emb_size, blk_size, division_fact, loss_type):
+    def __init__(self, h, tp, c, eps, epoch, batch_size, convergence, emb_size, blk_size, division_fact):
         super().__init__() 
         self.h = h
         self.tp = tp
@@ -50,7 +51,6 @@ class CritiGraph(torch.nn.Module):
         self.blk_size = blk_size
         self.locations = torch.randint(1 - self.n, self.n, (self.emb_size, self.tp), dtype=torch.int64, device=main_device)
         self.locations = [self.locations.clone().to(dev) for dev in self.devices]
-        self.loss_type = loss_type
         
         self.register_buffer('main_locations', self.locations[0].clone().cpu())
         self.main_distance_lookup_table = self.distance_lookup_table[0].clone().cpu()
@@ -100,43 +100,34 @@ class CritiGraph(torch.nn.Module):
     def calc_loss(self, 
                   ct_val : torch.Tensor, eu_val : torch.Tensor, 
                   mask   : torch.Tensor, lth    : torch.Tensor,
-                  epoch  : int = 0     , mode   : str = 'dyn' , loss_type: Dict = {}
+                  epoch  : int = 0     , mode   : str = 'dyn' ,
     ) -> torch.Tensor:
         ### ct_val: (B, T1, T2, C, D), eu_val: (B, T1, T2, C, D)
         ### mask  : (B, T1, T2, 1, 1), lth   : (B, T1, 1, 1)
         
-        ### step 1: 获取基本信息
-        strategy = get_strategy(loss_type, epoch)
-        cos_loss_type, prob_loss_type, method = strategy['cos_loss'], strategy['prob_loss'], strategy['method']['name']
-        
-        ### step 2: 计算 loss
-        if mode == 'dyn' or mode == 'sta':
-            if cos_loss_type == 'square':
-                loss = torch.square(ct_val - eu_val) # (B, T1, T2, C, tp)
-                loss = loss * mask                   # (B, T1, T2, C, tp)
-                loss = loss.sum(dim=2) / lth         # (B, T1, C, tp)
-            elif cos_loss_type == 'abs':
-                loss = torch.abs(ct_val - eu_val)    # (B, T1, T2, C, tp)
-                loss = loss * mask                   # (B, T1, T2, C, tp)
-                loss = loss.sum(dim=2) / lth         # (B, T1, C, tp)
-            
-        if mode == 'prob':
-            if prob_loss_type == 'kl':
-                loss = F.kl_div(
-                    F.log_softmax(ct_val, dim=2),
-                    F.log_softmax(eu_val, dim=2),
-                    log_target=True,
-                    reduction='none'
-                ).sum(dim=2)        # (B, T1, T2, C, tp) -> (B, T1, C, tp) 
-            elif prob_loss_type == 'js':
-                loss = js_div(
-                    F.log_softmax(ct_val, dim=2),
-                    F.log_softmax(eu_val, dim=2),
-                    log_target=True,
-                    reduction='none'
-                ).sum(dim=2)        # (B, T1, T2, C, tp) -> (B, T1, C, tp) 
-        
-        
+        if mode == 'dyn':
+            loss = compute_loss(loss_type['dyn_loss'],  ct_val, eu_val, lth, mask) # type: ignore
+        elif mode == 'sta':
+            loss = compute_loss(loss_type['sta_loss'],  ct_val, eu_val, lth, mask) # type: ignore  
+        elif mode == 'prob':
+            loss = compute_loss(loss_type['prob_loss'], ct_val, eu_val, lth, mask) # type: ignore
+        elif mode == 'weighted':
+            loss_dyn  = compute_loss(
+                loss_type['dyn_loss'],          # type: ignore
+                ct_val[:, :, :block_size, :, :], 
+                eu_val[:, :, :block_size, :, :], 
+                lth, 
+                mask  [:, :, :block_size, :, :]
+            ) # (B, T1, C, tp)
+            loss_prob = compute_loss(
+                loss_type['prob_loss'],         # type: ignore
+                ct_val[:, :, block_size:, :, :], 
+                eu_val[:, :, block_size:, :, :], 
+                lth, 
+                mask  [:, :, block_size:, :, :]
+            ) # (B, T1, C, tp)
+            loss = self.loss_strategy['ratio_dyn'] * loss_dyn + self.loss_strategy['ratio_prob'] * loss_prob # type: ignore
+
         return loss # (B, T1, C, tp)
         
         
@@ -155,7 +146,6 @@ class CritiGraph(torch.nn.Module):
              # (cB, T1, T2) = (B, T, V)       的时候，表示仅拟合 probability distribution
              # (cB, T1, T2) = (B+1, T, T+B+V) 的时候，表示三者联合优化
              mode: str,
-             train:  bool,
     ):
 
         cB, T1, T2, D = b_val_v.shape[0], b_val_v.shape[1], b_val_v.shape[2], self.tp
@@ -219,7 +209,7 @@ class CritiGraph(torch.nn.Module):
                 eu_val    = val_v[..., None, None].expand(ct_val.shape)                           # (B, T1, T2, C, tp)
                 mask, lth = self.neighbor_batch(B, T1, T2, epoch, dev_num=dev_num,)               # (B, T1, T2)
                 loss      = self.calc_loss(ct_val, eu_val, mask[..., None, None], lth[..., None, None], 
-                                           epoch=epoch, mode=mode, loss_type=self.loss_type)      # (B, T1, C, D)
+                                           epoch=epoch, mode=mode)      # (B, T1, C, D)
                 
                 
                 #### step 4: 挑选 loss 最小的位置
@@ -241,7 +231,7 @@ class CritiGraph(torch.nn.Module):
         for i, stream in enumerate(self.streams):
             stream.synchronize()
         
-        if train:
+        if self.loss_strategy['target'].startswith(mode):
             ### 更新与计算 ###
             for i, dev in enumerate(self.devices):
                 self.locations[i].index_copy_(
@@ -295,11 +285,11 @@ class CritiGraph(torch.nn.Module):
     
 
     # @timeit(name=f'neighbor_batch 函数主体')
-    def neighbor_batch(self, B: int, T1: int, T2: int, epoch: int, dev_num: int = 0, mark: Optional[Mark] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def neighbor_batch(self, B: int, T1: int, T2: int, epoch: int = 0, dev_num: int = 0, mark: Optional[Mark] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         device = self.devices[dev_num]
 
         # 收敛期：建议缓存这两个返回，避免每次重分配
-        if epoch > self.convergence * self.epoch:
+        if self.loss_strategy['converge'] is not None and epoch > self.loss_strategy['converge']:
             valid_mask = torch.ones((B, T1, T2), dtype=torch.bool, device=device)
             counts = torch.full((B, T1), T2, dtype=torch.float32, device=device)
             return valid_mask, counts
@@ -353,12 +343,18 @@ class CritiGraph(torch.nn.Module):
         ### 2. 遍历每个 epoch
         for epoch in range(self.epoch): 
             # if epoch < self.epoch * 0.85:  
+            
+            self.loss_strategy: PhaseConfig = get_strategy(loss_type, epoch)
+            if self.loss_strategy['target'] == 'weighted_dyn_prob':
+                self.loom(        epoch, sta[:,  :T]    , pos[:,   :]    , val_v[:,  :T,    : ]    , val_n[:,  :T,    : ]    ,
+                mode='weighted')
+            
             dyn_loss  = self.loom(epoch, sta[:,  :T]    , pos[:,   :T]   , val_v[:,  :T,    :T]    , val_n[:,  :T,    :T]    ,
-                mode='dyn' , train=True)
-            # sta_loss  = self.loom(epoch, sta[0:1, T:T+V], pos[0:1, T:T+V], val_v[0:1, T:T+V, T:T+V], val_n[0:1, T:T+V, T:T+V],
-            #     mode='sta' , train=epoch < self.epoch * 0.85)
-            # prob_loss = self.loom(epoch, sta[:,  :T]    , pos[:, T:T+V]  , val_v[:,  :T,   T:T+V]  , val_n[:,  :T,   T:T+V]  ,
-            #     mode='prob', train=True)
+                mode='dyn')
+            sta_loss  = self.loom(epoch, sta[0:1, T:T+V], pos[0:1, T:T+V], val_v[0:1, T:T+V, T:T+V], val_n[0:1, T:T+V, T:T+V],
+                mode='sta')
+            prob_loss = self.loom(epoch, sta[:,  :T]    , pos[:, T:T+V]  , val_v[:,  :T,   T:T+V]  , val_n[:,  :T,   T:T+V]  ,
+                mode='prob')
             print(f"current epoch: {epoch}, dyn_loss: {fmt6w(dyn_loss)}, sta_loss: {fmt6w(sta_loss)}, prob_loss: {fmt6w(prob_loss)}")
         
         

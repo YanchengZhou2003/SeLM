@@ -10,12 +10,11 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
+from loom_tritontest import triton_loom_wrapper
 from scipy.cluster.hierarchy import leaves_list, linkage
 from scipy.spatial.distance import pdist
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
-
-from loom_tritontest import triton_loom_wrapper
 
 main_device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 from typing import List, Tuple
@@ -74,18 +73,18 @@ class CritiGraph(torch.nn.Module):
         # _, exp = torch.frexp((xor_result + 1).to(torch.float32))
         # s = exp.float() / self.h
         s = self.distance_lookup_table[dev_num][xor_result]
-        f1 = (torch.floor(torch.log2(torch.abs(coord1).float() + 1)) + 1) / self.h
-        f2 = (torch.floor(torch.log2(torch.abs(coord2).float() + 1)) + 1) / self.h
-        return sg * (1 - s) * f1 * f2
+        # f1 = (torch.floor(torch.log2(torch.abs(coord1).float() + 1)) + 1) / self.h
+        # f2 = (torch.floor(torch.log2(torch.abs(coord2).float() + 1)) + 1) / self.h
+        return sg * (1 - s)
     
     def main_distance(self, coord1, coord2):
         coord1, coord2 = coord1.clone().cpu(), coord2.clone().cpu()
         sg = 1 - (((coord1 >= 0) ^ (coord2 >= 0)).to(torch.int16) << 1) 
         xor_result = torch.bitwise_xor(torch.abs(coord1), torch.abs(coord2))
         s = self.main_distance_lookup_table[xor_result]
-        f1 = (torch.floor(torch.log2(torch.abs(coord1).float() + 1)) + 1) / self.h
-        f2 = (torch.floor(torch.log2(torch.abs(coord2).float() + 1)) + 1) / self.h
-        return sg * (1 - s) * f1 * f2
+        # f1 = (torch.floor(torch.log2(torch.abs(coord1).float() + 1)) + 1) / self.h
+        # f2 = (torch.floor(torch.log2(torch.abs(coord2).float() + 1)) + 1) / self.h
+        return sg * (1 - s)
     
     def generate_random_masks(self, sz, dev_num=0):
         upper_bounds = 2**torch.arange(self.h, dtype=torch.int64, device=self.devices[dev_num])

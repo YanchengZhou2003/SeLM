@@ -3,20 +3,59 @@ import inspect
 import math
 import time
 from contextlib import ContextDecorator
-from typing import (Any, Callable, Dict, Iterable, List, Literal, Optional,
-                    Sequence, Tuple, Union)
+from typing import (Any, Callable, Dict, Iterable, List, Literal, Mapping,
+                    Optional, Sequence, Tuple, TypedDict, Union)
 
+import matplotlib
 import torch
-import matplotlib  
+
 matplotlib.use("Agg")  # 使用无界面后端，避免在服务器/笔记本上弹窗  
-import matplotlib.pyplot as plt 
-from scipy.cluster.hierarchy import linkage, leaves_list
-from scipy.spatial.distance import squareform, is_valid_y
 import warnings
+
+import matplotlib.pyplot as plt
 import numpy as np
+from scipy.cluster.hierarchy import leaves_list, linkage
+from scipy.spatial.distance import is_valid_y, squareform
 
 Mark = Callable[[str], None]
 _cache = {}
+# 单个阶段配置
+
+from typing import Literal, Mapping, TypedDict, Union
+
+
+# 仅目标 + 收敛
+class PhaseConfigBase(TypedDict):
+    target: Literal['dyn_only', 'sta_only', 'alternated', 'prob_only']
+    converge: int
+
+# 带权重的阶段（用于 weighted_dyn_prob）
+class PhaseConfigWeighted(TypedDict):
+    target: Literal['weighted_dyn_prob']
+    converge: int
+    ratio_dyn: float
+    ratio_prob: float
+
+PhaseConfig = Union[PhaseConfigBase, PhaseConfigWeighted]
+
+# 顶层字典的值类型：三类字符串 loss 的值 + 阶段配置
+TopValue = Union[
+    Literal['square'],  # dyn_loss, sta_loss 取 'square'
+    Literal['abs'],  # dyn_loss, sta_loss 取 'square'
+    Literal['kl'],      # prob_loss 取 'kl'
+    Literal['js'],      # prob_loss 取 'js'
+    PhaseConfig         # 整数键对应的阶段配置
+]
+
+# 顶层键类型：字符串键 或 整数键
+TopKey = Union[
+    Literal['dyn_loss', 'sta_loss', 'prob_loss'],
+    int  # 阶段边界 epoch
+]
+
+LossTypeDict = Mapping[TopKey, TopValue]
+
+
 def timeit(
     name: Optional[str] = None,
     *,
@@ -203,9 +242,9 @@ def to_dev(
     sliced = tuple(t.__getitem__(slice(s, e)) for t in tensors)  # 避免触发高级索引
     return tuple(t.to(dev, non_blocking=True) for t in sliced)
 
-def get_strategy(loss_type: dict, epoch: int) -> dict:
+def get_strategy(loss_type: LossTypeDict, epoch: int) -> PhaseConfig:
     # 找到所有小于等于 epoch 的阈值
-    valid_keys = [k for k in loss_type.keys() if epoch <= k]
+    valid_keys = [k for k in loss_type.keys() if isinstance(k, int) and epoch <= k]
     if not valid_keys:
         # 若没有上界覆盖，则可选择返回最大键对应配置或抛错
         raise ValueError(f"No strategy configured for epoch={epoch}")
@@ -233,58 +272,6 @@ def fmt6w(x):
     return f"{s:>6}"[:6]
 
 
-def js_div(
-    input,                 # P：log-prob 或 prob
-    target,                # Q：log-prob 或 prob
-    log_input: bool = True,
-    log_target: bool = False,
-    reduction: str = 'none',  # 与 F.kl_div 一致的默认
-    eps: float = 1e-12
-):
-    """
-    返回与 input/target 同形的逐元素 JS 的“密度项”，
-    需要调用方沿分布维 sum（与 F.kl_div 的使用一致）。
-    说明：这里的“逐元素”指把 KL 的 integrand 展开到分布维上。
-    """
-    # 统一为 log 概率
-    if log_input:
-        logP = input
-    else:
-        P = input.clamp_min(eps)
-        P = P / P.sum(dim=-1, keepdim=True).clamp_min(eps)
-        logP = P.log()
-
-    if log_target:
-        logQ = target
-    else:
-        Q = target.clamp_min(eps)
-        Q = Q / Q.sum(dim=-1, keepdim=True).clamp_min(eps)
-        logQ = Q.log()
-
-    # logM = log(0.5*P + 0.5*Q)
-    logM = torch.logaddexp(logP, logQ) - math.log(2.0)
-
-    # 逐元素 KL integrand：P*(logP-logM) 与 Q*(logQ-logM)
-    P = torch.exp(logP)
-    Q = torch.exp(logQ)
-    elem_kl_p_m = P * (logP - logM)
-    elem_kl_q_m = Q * (logQ - logM)
-
-    # 逐元素 JS integrand 的和（还没沿分布维 sum）
-    elem_js = 0.5 * (elem_kl_p_m + elem_kl_q_m)  # 形状与 input 相同
-
-    if reduction == 'none':
-        return elem_js
-    elif reduction == 'sum':
-        return elem_js.sum()
-    elif reduction == 'mean':
-        return elem_js.mean()
-    elif reduction == 'batchmean':
-        # 约定 batch 在 0 维；与 F.kl_div 相同语义：先总和，再除以 batch 大小
-        return elem_js.sum() / max(elem_js.size(0), 1)
-    else:
-        raise ValueError(f"Invalid reduction: {reduction}")
-    
     
 def is_all_ones(
     x: torch.Tensor,
@@ -883,3 +870,4 @@ def save_paired_hierarchy_heatmaps(
     fig.savefig(path, bbox_inches="tight", dpi=dpi)
     plt.close(fig)
     return path
+

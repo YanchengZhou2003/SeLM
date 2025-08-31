@@ -24,10 +24,10 @@ h=27
 tp=2
 c=1 
 eps=1e-5 
-epoch_cte=3
+epoch_cte=20
 batch_size_cte=64
 convergence=0.8
-division_fact=1
+division_fact=4
 
 # hyperparameters - combination
 ratio_cb = 100
