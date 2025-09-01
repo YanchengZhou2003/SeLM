@@ -63,6 +63,7 @@ def compute_loss(
     eu_val: torch.Tensor,
     lth: torch.Tensor | float | int,
     mask: Optional[torch.Tensor] = None,
+    sum_dim: int = 2,
 ) -> torch.Tensor:
     """
     计算 loss：
@@ -76,18 +77,18 @@ def compute_loss(
     if kind == 'square':
         loss = torch.square(ct_val - eu_val)          # (B, T1, T2, C, tp)
         loss = loss * mask
-        loss = loss.sum(dim=2) / lth                  # (B, T1, C, tp)
+        loss = loss.sum(dim=sum_dim) / lth            # (B, T1, C, tp)
         return loss
 
     if kind == 'abs':
         loss = torch.abs(ct_val - eu_val)             # (B, T1, T2, C, tp)
         loss = loss * mask
-        loss = loss.sum(dim=2) / lth                  # (B, T1, C, tp)
+        loss = loss.sum(dim=sum_dim) / lth            # (B, T1, C, tp)
         return loss
 
     # 概率型：对类别维做 softmax，再计算散度
-    log_ct = F.log_softmax(ct_val, dim=2)
-    log_eu = F.log_softmax(eu_val, dim=2)
+    log_ct = F.log_softmax(ct_val, dim=sum_dim)
+    log_eu = F.log_softmax(eu_val, dim=sum_dim)
 
     if kind == 'kl':
         loss = F.kl_div(
@@ -105,5 +106,5 @@ def compute_loss(
         raise ValueError(f'Unsupported loss kind: {kind}')
 
     loss = loss * mask
-    loss = loss.sum(dim=2)                            # (B, T1, C, tp)
+    loss = loss.sum(dim=sum_dim)                      # (B, T1, C, tp)
     return loss

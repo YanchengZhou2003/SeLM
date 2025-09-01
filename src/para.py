@@ -4,10 +4,12 @@ import torch
 
 from src.utils import LossTypeDict
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "4,5,6,7"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
 
 # hyperparameters - gpt
 batch_size = 32 # how many independent sequences will we process in parallel?
+val_batch_size = 1
+TTT_batch_size = 256
 block_size = 128 # what is the maximum context length for predictions?
 max_iters = 10000
 gpt_save_interval = 1000
@@ -27,7 +29,7 @@ c=1
 eps=1e-5 
 batch_size_cte=batch_size
 convergence=0.8
-division_fact=2
+division_fact=1
 
 
 loss_type: LossTypeDict = {
@@ -50,7 +52,6 @@ loss_type: LossTypeDict = {
     }
 }
 epoch_cte=200
-
 ### dyn_loss / sta_loss 可选: 'abs', 'square'
 ### prob_loss 可选: 'kl' , 'js'
 ### method    可选: 
@@ -59,6 +60,15 @@ epoch_cte=200
 ##### 'name': 'prob_only' , 表示当前仅优化 prob_loss，其它 loss 只计算、不优化
 ##### 'name': 'alternated', 表示交替优化, 一个 epoch 依次优化 dyn / sta / prob
 ##### 'name': 'weighted_dyn_prob'  , 表示加权优化. 需要额外指定 'ratio_dyn' 和 'ratio_prob', 且它们加和为 1
+
+TTT_loss_type : LossTypeDict = {
+    'dyn_loss'    : 'square', # dyn:  dynamic
+    -1: {
+        'target'  : 'TTT_only' , 
+        'converge': 0
+    }, 
+}
+epoch_cte_TTT=25
 
 # ------------
 

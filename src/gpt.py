@@ -1,4 +1,6 @@
+import json
 import os
+import random
 from datetime import datetime
 
 import torch
@@ -16,35 +18,36 @@ encode = lambda s: [stoi[c] for c in s] # encoder: take a string, output a list 
 decode = lambda l: ''.join([itos[i] for i in l]) # decoder: take a list of integers, output a string
 
 # Train and test splits
-data = torch.tensor(encode(text), dtype=torch.long)
+data = torch.tensor(encode(text), dtype=torch.long, pin_memory=True)
 text_size = len(data)
-datai = torch.tensor([i * block_size for i in range(text_size)], dtype=torch.long)
+datai = torch.tensor([i * block_size for i in range(text_size)], dtype=torch.long, pin_memory=True)
 n = int(0.9*text_size) # first 90% will be train, rest val
 train_data = data[:n]
 val_data = data[n:]
 train_datai = datai[:n]
 val_datai = datai[n:]
 
-da = (torch.arange(vocab_size) + text_size * block_size).unsqueeze(0).expand(batch_size, -1)
+da = (torch.arange(vocab_size) + text_size * block_size).unsqueeze(0).expand(batch_size, -1) # (B, vocab_size)
 
 # Train Cache
 _train_cache = []
 
 # data loading
-def get_batch(split):
+def get_batch(split, ix=None):
     # generate a small batch of data of inputs x and targets y
     data = train_data if split == 'train' else val_data
     datai = train_datai if split == 'train' else val_datai
-    ix = torch.randint(len(data) - block_size, (batch_size,))
+    if ix is None:
+        ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([data[i:i+block_size] for i in ix])
     xi = torch.stack([datai[i:i+block_size] for i in ix])
     xi_pad = torch.arange(0, block_size).unsqueeze(0)
     xi = xi + xi_pad
     
-    xi = torch.cat((xi, da), dim=1)
+    xi = torch.cat((xi, da[0:1].repeat(xi.size(0), 1)), dim=1)
     y = torch.stack([data[i+1:i+block_size+1] for i in ix])
     x, xi, y = x.to(device), xi.to(device), y.to(device)
-    return x, xi, y
+    return x, xi, y, ix
 
 class Head(nn.Module):
     """ one head of self-attention """
@@ -122,7 +125,7 @@ class GPTLanguageModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
-        self.cte = CritiGraph(h, tp, c, eps, epoch_cte, batch_size_cte, convergence, text_size * block_size + vocab_size, block_size + vocab_size, division_fact)
+        self.cte = CritiGraph(h, tp, c, eps, epoch_cte, batch_size_cte, convergence, text_size * block_size + vocab_size, block_size + vocab_size, division_fact, loss_type)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
         self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
         self.ln_f = nn.LayerNorm(n_embd) # final layer norm
@@ -137,8 +140,12 @@ class GPTLanguageModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, idi, targets: torch.Tensor, train_cte=False,
-                visualization=False):
+    def forward(self, idx, idi, targets, 
+                id_pos=None,
+                train_cte=False,
+                visualization=False,
+                return_dyn_emb=False
+    ):
         B, T, V = batch_size, block_size, vocab_size
         # idx and targets are both (B,T) tensor of integers
         tok_emb = self.token_embedding_table(idx) # (B,T,E)
@@ -146,6 +153,9 @@ class GPTLanguageModel(nn.Module):
         x = tok_emb + pos_emb # (B,T,E)
         x = self.blocks(x) # (B,T,E)
         x: torch.Tensor = self.ln_f(x) # (B,T,E)
+        if return_dyn_emb:
+            return x
+        
         token_embeddings = self.token_embedding_table.weight  # (V, E)
         logits_eu = torch.matmul(x, token_embeddings.t()) # (B, T, V)
 
@@ -200,6 +210,78 @@ class GPTLanguageModel(nn.Module):
         
         return logits_eu, loss_eu, loss_ct, 0, 0
 
+    def TTT_cte_forward(self, 
+                        x_train: torch.Tensor,    # (vB, T)
+                        x_valid: torch.Tensor,    # (tB, T)
+                        sta    : torch.Tensor,    # (vB, T)
+                        pos    : torch.Tensor,    # (tB, T)
+                        targets: torch.Tensor     # (vB, T)
+    ):
+        ### step.1 获取欧式空间信息
+        dyn_train: torch.Tensor = self.forward(x_train, None, None, return_dyn_emb=True) # type: ignore
+        dyn_train               = dyn_train.reshape(-1, dyn_train.size(2)) # (tB, T, E) -> (tB * T, E)
+        dyn_valid: torch.Tensor = self.forward(x_valid, None, None, return_dyn_emb=True) # type: ignore
+        dyn_valid               = dyn_valid.reshape(-1, dyn_valid.size(2)) # (vB, T, E) -> (vB * T, E)
+        sta_emb                 = self.token_embedding_table.weight        # (V ,    E)
+        
+        ### step.2 获取范数信息以及归一化
+        dyn_train_norm   = torch.norm(dyn_train, dim=-1, keepdim=True).clamp_min(1e-12) # (tB * T, 1)
+        dyn_train_normed = dyn_train / dyn_train_norm
+        dyn_valid_norm   = torch.norm(dyn_valid, dim=-1, keepdim=True).clamp_min(1e-12) # (vB * T, 1)
+        dyn_valid_normed = dyn_valid / dyn_valid_norm
+        sta_emb_norm     = torch.norm(sta_emb, dim=-1, keepdim=True).clamp_min(1e-12) # (V, 1)
+        sta_emb_normed   = sta_emb / sta_emb_norm 
+        
+        ### step.3 获取 CTE 需要拟合的内容
+        val = dyn_valid_normed @ dyn_train_normed.t()             # (vB * T, E) @ (tB * T, E) -> (vB * T, tB * T)
+        val_mask = torch.ones_like(val, dtype=torch.bool)         # (vB * T, tB * T)
+        val_norm = torch.ones_like(val)                           # (vB * T, tB * T)
+
+        ### step.4 对 CTE 进行 test-time training
+        sta = sta.reshape(-1) # (vB, T) -> (vB * T)
+        pos = pos.reshape(-1) # (tB, T) -> (tB * T) 
+        TTT_loss = self.cte.forward_TTT(
+            sta, pos     ,  
+            val, val_norm,
+        ) # (vB * T, C, tp)
+        
+        return TTT_loss
+
+        # return loss_ct, loss_eu
+    def TTT_get_loss(self, 
+                     x_valid: torch.Tensor, # (vB, T)
+                     sta    : torch.Tensor, # (vB, T)
+                     targets: torch.Tensor  # (vB, T)
+    ):
+        vB, T = sta.size(0), sta.size(1)
+        ### step.1 获取欧式空间信息
+        dyn_valid: torch.Tensor = self.forward(x_valid, None, None, return_dyn_emb=True) # type: ignore
+        dyn_valid_norm          = torch.norm(
+            dyn_valid, dim=-1, keepdim=True
+        ).clamp_min(1e-12)                                                 # (vB, T, 1)
+        sta_emb                 = self.token_embedding_table.weight        # (V ,    E)
+        sta_emb_norm            = torch.norm(
+            sta_emb, dim=-1, keepdim=True
+        ).clamp_min(1e-12)                                                 # (V, 1)
+        voc                     = da[0:1, :].repeat(vB, 1).to(device)      # (vB, V)
+        norm = dyn_valid_norm * sta_emb_norm.reshape(1, 1, vocab_size)     # (vB, T, 1) * (1, 1, V) -> (vB, T, V)
+
+        #### step.2 获取 logits
+        logits_ct = self.cte.distance(
+            self.cte.locations[0][sta].unsqueeze(2),       # (vB, T, 1, tp)
+            self.cte.locations[0][voc].unsqueeze(1),       # (vB, 1, V, tp)
+            norm[..., None],                               # (vB, T, V, 1)
+            dev_num=0
+        ).mean(dim=-1)                        # (vB, T, V)
+        logits_eu = dyn_valid @ sta_emb.t()   # (vB, T, E) @ (E, V) -> (vB, T, V)
+        
+        ### step.3 获取损失
+        loss_ct = F.cross_entropy(logits_ct.view(-1, vocab_size), targets.view(-1), reduction='none').reshape(vB, T) # (vB , T)
+        loss_eu = F.cross_entropy(logits_eu.view(-1, vocab_size), targets.view(-1), reduction='none').reshape(vB, T) # (vB , T)
+        
+        return loss_eu, loss_ct
+
+
 @torch.no_grad()
 def evaluate(model: GPTLanguageModel):
     out = {}
@@ -209,7 +291,7 @@ def evaluate(model: GPTLanguageModel):
         losses_cts = torch.zeros(eval_iters)
         losses_gap = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            X, XI, Y = get_batch(split)
+            X, XI, Y, _ = get_batch(split)
             _, loss_ori, loss_cts, loss_gap = model(X, XI, targets=Y, evaluation=1)
             losses_ori[k] = loss_ori.item()
             losses_cts[k] = loss_cts.item()
@@ -227,7 +309,7 @@ def train_gpt():
     running_loss = []
     for iter in range(max_iters):
         
-        xb, xi, yb = get_batch('train')
+        xb, xi, yb, _ = get_batch('train')
         _, loss, _, _ = model(xb, xi, targets=yb)
         optimizer.zero_grad(set_to_none=True)
         running_loss.append(loss.item())
@@ -244,7 +326,7 @@ def train_cte(gpt_cktp: str, cte_cktp: str, train_cache_cktp: str):
     model: GPTLanguageModel = GPTLanguageModel().to(device)
     model_cktp = torch.load(gpt_cktp)
     load_state_dict_skip_prefixes(model, model_cktp, prefixes_to_skip=("cte",), strict=False)
-    model.cte = CritiGraph(h, tp, c, eps, epoch_cte, batch_size_cte, convergence, text_size * block_size + vocab_size, block_size + vocab_size, division_fact)
+    model.cte = CritiGraph(h, tp, c, eps, epoch_cte, batch_size_cte, convergence, text_size * block_size + vocab_size, block_size + vocab_size, division_fact, loss_type)
     
     model.eval()
     for iter in range(max_iters):
@@ -253,8 +335,8 @@ def train_cte(gpt_cktp: str, cte_cktp: str, train_cache_cktp: str):
         else:
             visualization = False
         
-        xb, xi, yb = get_batch('train')
-        _train_cache.append(xb)
+        xb, xi, yb, ix = get_batch('train')
+        _train_cache.append(ix)
         
         _, loss_eu, loss_ct, _, var = model(xb, xi, targets=yb, train_cte=1, visualization=visualization)
         print(f"current train iter: {iter}, loss_eu: {fmt6w(loss_eu.item())}, loss_ct: {loss_ct.item()}")
@@ -269,12 +351,58 @@ def validate_cte(gpt_cktp: str, cte_cktp: str, train_cache_cktp: str):
     model: GPTLanguageModel = GPTLanguageModel().to(device)
     model_cktp = torch.load(gpt_cktp)
     load_state_dict_skip_prefixes(model, model_cktp, prefixes_to_skip=("cte",), strict=False)
-    model.cte = CritiGraph(h, tp, c, eps, epoch_cte, batch_size_cte, convergence, text_size * block_size + vocab_size, block_size + vocab_size, division_fact)
+    del model.cte
+    torch.cuda.empty_cache()
+    model.cte = CritiGraph(h, tp, c, eps, epoch_cte, batch_size_cte, convergence, text_size * block_size + vocab_size, block_size + vocab_size, division_fact, TTT_loss_type)
+    
     model.cte.load_state_dict(torch.load(cte_cktp))
+    del model.cte.locations
+    torch.cuda.empty_cache()
+    
+    model.cte.locations = [model.cte.main_locations.to(model.cte.devices[i]) for i in range(len(model.cte.devices))]
     train_cache = torch.load(train_cache_cktp)
+    train_cache = torch.cat(train_cache, dim=0) # (sumB)
+    
+    loss_dict = {
+        "per_sample": [[] for _ in range(0, train_cache.size(0), train4test_val)],
+        "per_lth"   : [[] for _ in range(block_size)],
+        "per_epoch" : []
+    }
+    
+    '''
+    目前为写回式更改，请注意啊啊啊啊啊啊啊啊啊啊啊啊啊啊啊啊
+    '''
     
     
+    for st_point in range(0, len(val_data), val_batch_size * block_size): # 每次取出 val_batch_size * block_size 个字符
+        ### step 1: 获取当前阶段需要 val 的数据
+        ix = st_point + torch.arange(0, val_batch_size) * block_size # 仅拿出单个 block，去除 batch 维度
+        xb_val, idi_val, yb_val, _ = get_batch('val', ix=ix) # (vB, T), (vB, T), (vB, T)
+ 
+ 
+        total_TTT_loss = torch.zeros((val_batch_size * block_size, 2 * model.cte.k * model.cte.h + 1, model.cte.tp), pin_memory=True)
+        for epoch in range(epoch_cte_TTT):
+            for i, pos_id in enumerate(range(0, train_cache.size(0), TTT_batch_size)): # 每次取出 TTT_batch_size 个样本
+                ### step 2: 获取当前拿来 test-time training 的数据
+                ix_train = train_cache[pos_id : pos_id + TTT_batch_size] # (tB)
+                xb_train, idi_train, yb_train, _ = get_batch('train', ix=ix_train) # (tB, T), (tB, T), (tB, T)
 
+                TTT_loss = model.TTT_cte_forward(
+                    xb_train, xb_val,
+                    idi_val[:, :block_size], idi_train[:, :block_size],
+                    yb_val
+                ) # (vB * T, C, tp)
+                
+                total_TTT_loss += TTT_loss
+                print(f"epoch: {epoch} / {epoch_cte_TTT}, step: {i} / {train_cache.size(0) // TTT_batch_size}, TTT_loss: {TTT_loss.mean().item()}")
+
+            model.cte.update_TTT(total_TTT_loss) # 全局更新
+            loss_eu, loss_ct = model.TTT_get_loss(xb_val, idi_val[:, :block_size], yb_val) # (vB, T)
+            print(f"epoch: {epoch} / {epoch_cte_TTT}, val_loss_eu: {loss_eu.mean().item()}, val_loss_ct: {loss_ct.mean().item()}")
+            
+            
+        break # 只测试某一个 val
+            
 
 
 def visualize_similarity(model, var, iter):
@@ -371,16 +499,18 @@ def visualize_similarity(model, var, iter):
 
 
 
-
-
-
-
 if __name__ == "__main__":
     gpt_ckpt = "iters_4000.pth"
-    cte_ckpt = "gpt_iters_4000_cte_iters_{}"
-    train_cache_ckpt = "gpt_iters_4000_cte_iters_{}_train_cache"
+    cte_ckpt = "gpt_iters_4000_cte_iters_{}.pth"
+    train_cache_ckpt = "gpt_iters_4000_cte_iters_{}_train_cache.pth"
     
     # train_gpt()
-    train_cte(os.path.join(gpt_path, gpt_ckpt),
-              os.path.join(cte_path, cte_ckpt),
-              os.path.join(train_cache_path, train_cache_ckpt))
+    # train_cte(os.path.join(gpt_path, gpt_ckpt),
+    #           os.path.join(cte_path, cte_ckpt),
+    #           os.path.join(train_cache_path, train_cache_ckpt))
+    
+    
+    validate_cte(os.path.join(gpt_path, gpt_ckpt),
+              os.path.join(cte_path, cte_ckpt.format(100)),
+              os.path.join(train_cache_path, train_cache_ckpt.format(100)))
+                 

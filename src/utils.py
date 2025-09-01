@@ -26,7 +26,7 @@ from typing import Literal, Mapping, TypedDict, Union
 
 # 仅目标 + 收敛
 class PhaseConfigBase(TypedDict):
-    target: Literal['dyn_only', 'sta_only', 'alternated', 'prob_only']
+    target: Literal['dyn_only', 'sta_only', 'alternated', 'prob_only', 'TTT_only']
     converge: int
 
 # 带权重的阶段（用于 weighted_dyn_prob）
@@ -232,15 +232,40 @@ def to_dev(
     device: torch.device | str = 'cpu',
     s: Optional[int] = None,
     e: Optional[int] = None,
-) -> Tuple[torch.Tensor, ...]:
+    dim: int = 0,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
     """
-    将若干张量的 dim=0 切片 [s:e] 非阻塞传输到指定 device，并按顺序返回。
+    将若干张量在指定维度 dim 上做切片 [s:e]，并以非阻塞方式传输到指定 device。
     - 若 s、e 为 None，则等价于整段 [:]
     - 要求所有输入是 torch.Tensor
+    - 通过构造 slice 元组避免触发高级索引
+    - 若仅有一个张量输入，则返回该张量本身；否则返回包含各张量的元组
     """
     dev = torch.device(device)
-    sliced = tuple(t.__getitem__(slice(s, e)) for t in tensors)  # 避免触发高级索引
-    return tuple(t.to(dev, non_blocking=True) for t in sliced)
+
+    def _slice_along_dim(t: torch.Tensor) -> torch.Tensor:
+        if not isinstance(t, torch.Tensor):
+            raise TypeError(f"to_dev expects torch.Tensor, got {type(t)}")
+
+        # 规范化 dim，支持负维度
+        d = dim if dim >= 0 else dim + t.dim()
+        if d < 0 or d >= t.dim():
+            raise IndexError(
+                f"dim out of range (got {dim} for tensor with {t.dim()} dims)"
+            )
+
+        # 构造所有维度为 ":" 的索引列表，再在 dim 位置替换为 slice(s, e)
+        index = [slice(None)] * t.dim()
+        index[d] = slice(s, e)
+        return t.__getitem__(tuple(index))
+
+    sliced = tuple(_slice_along_dim(t) for t in tensors)
+    moved = tuple(t.to(dev, non_blocking=True) for t in sliced)
+
+    # 仅一个张量时，直接返回该张量
+    if len(moved) == 1:
+        return moved[0]
+    return moved
 
 def get_strategy(loss_type: LossTypeDict, epoch: int) -> PhaseConfig:
     # 找到所有小于等于 epoch 的阈值
