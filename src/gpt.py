@@ -5,11 +5,13 @@ from datetime import datetime
 
 import torch
 import torch.nn as nn
+from rotary_embedding_torch import RotaryEmbedding
 from torch.nn import functional as F
 
 from src.cte import *
 from src.para import *
 from src.utils import *
+from src.vis import *
 
 # create a mapping from characters to integers
 stoi = { ch:i for i,ch in enumerate(chars) }
@@ -57,14 +59,16 @@ class Head(nn.Module):
         self.key = nn.Linear(n_embd, head_size, bias=False)
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
-        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
-
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)), persistent=False)
+        self.rope = RotaryEmbedding(dim=head_size)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         B,T,C = x.shape
         k = self.key(x)   # (B,T,hs)
-        q = self.query(x) # (B,T,hs)
+        q = self.query(x) # (B,T,hs)  
+        q = self.rope.rotate_queries_or_keys(q)
+        k = self.rope.rotate_queries_or_keys(k)
         wei = q @ k.transpose(-2,-1) * k.shape[-1]**-0.5 # (B, T, hs) @ (B, hs, T) -> (B, T, T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
         wei = F.softmax(wei, dim=-1) # (B, T, T)
@@ -125,8 +129,8 @@ class GPTLanguageModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+        # self.position_embedding_table = nn.Embedding(block_size, n_embd)
         self.cte = CritiGraph(h, tp, c, eps, epoch_cte, batch_size_cte, convergence, text_size * block_size + vocab_size, block_size + vocab_size, division_fact, loss_type)
-        self.position_embedding_table = nn.Embedding(block_size, n_embd)
         self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
         self.ln_f = nn.LayerNorm(n_embd) # final layer norm
 
@@ -149,8 +153,8 @@ class GPTLanguageModel(nn.Module):
         B, T, V = batch_size, block_size, vocab_size
         # idx and targets are both (B,T) tensor of integers
         tok_emb = self.token_embedding_table(idx) # (B,T,E)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,E)
-        x = tok_emb + pos_emb # (B,T,E)
+        # pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,E)
+        x = tok_emb # + pos_emb # (B,T,E)
         x = self.blocks(x) # (B,T,E)
         x: torch.Tensor = self.ln_f(x) # (B,T,E)
         if return_dyn_emb:
@@ -180,6 +184,9 @@ class GPTLanguageModel(nn.Module):
                             emb_norm.transpose(1, 2)[:, :, T:T+V])              # (B, T, 1) * (B, V, 1) -> (B, T, V)
             # val[:, :T, T:T+V] *= logits_norm                                  # (B, :T, T:T+V) * (B, T, V)
             val[:, :T, T:T+V] = to_one_hot_logits(targets, V)
+            # val[:, :T, T:T+V] = make_soft_targets(targets, V, return_logits=True, eps=0.05)
+            # val[:, :T, T:T+V] = directed_label_smoothing(targets, logits_eu)
+            # val[:, :T, T:T+V] = logits_eu
             
             #### step 1.3: 直接拿来乘的 Euclidean Norm
             val_norm               = torch.ones_like(val)                       # (B, T+V, T+V)
@@ -215,7 +222,7 @@ class GPTLanguageModel(nn.Module):
                         x_valid: torch.Tensor,    # (tB, T)
                         sta    : torch.Tensor,    # (vB, T)
                         pos    : torch.Tensor,    # (tB, T)
-                        targets: torch.Tensor     # (vB, T)
+                        targets: torch.Tensor,    # (vB, T),
     ):
         ### step.1 获取欧式空间信息
         dyn_train: torch.Tensor = self.forward(x_train, None, None, return_dyn_emb=True) # type: ignore
@@ -248,10 +255,11 @@ class GPTLanguageModel(nn.Module):
         return TTT_loss
 
         # return loss_ct, loss_eu
-    def TTT_get_loss(self, 
-                     x_valid: torch.Tensor, # (vB, T)
-                     sta    : torch.Tensor, # (vB, T)
-                     targets: torch.Tensor  # (vB, T)
+    def TTT_get_loss(
+        self, 
+        x_valid: torch.Tensor, # (vB, T)
+        sta    : torch.Tensor, # (vB, T)
+        targets: torch.Tensor  # (vB, T)
     ):
         vB, T = sta.size(0), sta.size(1)
         ### step.1 获取欧式空间信息
@@ -279,7 +287,25 @@ class GPTLanguageModel(nn.Module):
         loss_ct = F.cross_entropy(logits_ct.view(-1, vocab_size), targets.view(-1), reduction='none').reshape(vB, T) # (vB , T)
         loss_eu = F.cross_entropy(logits_eu.view(-1, vocab_size), targets.view(-1), reduction='none').reshape(vB, T) # (vB , T)
         
-        return loss_eu, loss_ct
+        return loss_eu, loss_ct, logits_eu, logits_ct
+    
+    def get_sim(self, eu_x: torch.Tensor, eu_y: torch.Tensor,
+                      ct_x: torch.Tensor, ct_y: torch.Tensor) -> Tuple[np.ndarray, np.ndarray]:
+        eu_x = F.normalize(self.forward(eu_x, None, None, return_dyn_emb=True), dim=-1).squeeze()
+        eu_y = F.normalize(self.forward(eu_y, None, None, return_dyn_emb=True), dim=-1).squeeze()
+        sim_eu = eu_x @ eu_y.t()
+        
+        ct_x = self.cte.main_locations[ct_x.cpu()]
+        ct_y = self.cte.main_locations[ct_y.cpu()]
+        
+        print(eu_x.shape, eu_y.shape, ct_x.shape, ct_y.shape)
+        
+        sim_ct = self.cte.main_distance(
+                ct_x.unsqueeze(1), ct_y.unsqueeze(0),
+                torch.ones((ct_x.shape[0], ct_y.shape[0], 1))
+        ).mean(dim=-1)
+        
+        return sim_eu.cpu().numpy(), sim_ct.cpu().numpy()
 
 
 @torch.no_grad()
@@ -301,7 +327,7 @@ def evaluate(model: GPTLanguageModel):
     return out
 
 
-def train_gpt():
+def train_gpt(gpt_ckpt: str):
     model: GPTLanguageModel = GPTLanguageModel().to(device)
     # print the number of parameters in the model
     print(sum(p.numel() for p in model.parameters())/1e6, 'M parameters')
@@ -310,7 +336,7 @@ def train_gpt():
     for iter in range(max_iters):
         
         xb, xi, yb, _ = get_batch('train')
-        _, loss, _, _ = model(xb, xi, targets=yb)
+        _, loss, _, _, _ = model(xb, xi, targets=yb)
         optimizer.zero_grad(set_to_none=True)
         running_loss.append(loss.item())
         loss.backward()
@@ -319,14 +345,20 @@ def train_gpt():
         if iter % gpt_save_interval == 0 or iter == max_iters - 1:
             print(f"current iter: {iter}, avg loss in last {gpt_save_interval} iters: {sum(running_loss) / len(running_loss)}")
             running_loss = []
-            torch.save(model.state_dict(), os.path.join(gpt_path, f"iters_{iter}.pth"))
+            torch.save(model.state_dict(), os.path.join(gpt_path, gpt_ckpt.format(iter)))
 
 @torch.no_grad()
 def train_cte(gpt_cktp: str, cte_cktp: str, train_cache_cktp: str):
-    model: GPTLanguageModel = GPTLanguageModel().to(device)
-    model_cktp = torch.load(gpt_cktp)
-    load_state_dict_skip_prefixes(model, model_cktp, prefixes_to_skip=("cte",), strict=False)
+    model: GPTLanguageModel = GPTLanguageModel()
+    model_cktp = torch.load(gpt_cktp, map_location='cpu')
+    
+    load_partial_state_dict(model, model_cktp, skip_substrings=["cte"], strict=False)
+    del model.cte
+    
+    torch.cuda.empty_cache()
     model.cte = CritiGraph(h, tp, c, eps, epoch_cte, batch_size_cte, convergence, text_size * block_size + vocab_size, block_size + vocab_size, division_fact, loss_type)
+    
+    model = model.to(device)
     
     model.eval()
     for iter in range(max_iters):
@@ -348,58 +380,90 @@ def train_cte(gpt_cktp: str, cte_cktp: str, train_cache_cktp: str):
 
 @torch.no_grad()
 def validate_cte(gpt_cktp: str, cte_cktp: str, train_cache_cktp: str):
-    model: GPTLanguageModel = GPTLanguageModel().to(device)
-    model_cktp = torch.load(gpt_cktp)
-    load_state_dict_skip_prefixes(model, model_cktp, prefixes_to_skip=("cte",), strict=False)
+    model: GPTLanguageModel = GPTLanguageModel()
+    model_cktp = torch.load(gpt_cktp, map_location='cpu')
+    
+    load_partial_state_dict(model, model_cktp, skip_substrings=["cte"], strict=False)
     del model.cte
     torch.cuda.empty_cache()
     model.cte = CritiGraph(h, tp, c, eps, epoch_cte, batch_size_cte, convergence, text_size * block_size + vocab_size, block_size + vocab_size, division_fact, TTT_loss_type)
-    
     model.cte.load_state_dict(torch.load(cte_cktp))
     del model.cte.locations
     torch.cuda.empty_cache()
     
     model.cte.locations = [model.cte.main_locations.to(model.cte.devices[i]) for i in range(len(model.cte.devices))]
+    model = model.to(device)
+    
     train_cache = torch.load(train_cache_cktp)
     train_cache = torch.cat(train_cache, dim=0) # (sumB)
+    train_cache = train_cache[:1]
     
-    loss_dict = {
-        "per_sample": [[] for _ in range(0, train_cache.size(0), train4test_val)],
-        "per_lth"   : [[] for _ in range(block_size)],
-        "per_epoch" : []
-    }
+    # loss_dict = {
+    #     "per_sample": [[] for _ in range(0, train_cache.size(0), train4test_val)],
+    #     "per_lth"   : [[] for _ in range(block_size)],
+    #     "per_epoch" : []
+    # }
     
     '''
     目前为写回式更改，请注意啊啊啊啊啊啊啊啊啊啊啊啊啊啊啊啊
     '''
     
-    
-    for st_point in range(0, len(val_data), val_batch_size * block_size): # 每次取出 val_batch_size * block_size 个字符
+    model.eval()
+    for st_point in range(1, len(val_data), val_batch_size * block_size): # 每次取出 val_batch_size * block_size 个字符
         ### step 1: 获取当前阶段需要 val 的数据
         ix = st_point + torch.arange(0, val_batch_size) * block_size # 仅拿出单个 block，去除 batch 维度
         xb_val, idi_val, yb_val, _ = get_batch('val', ix=ix) # (vB, T), (vB, T), (vB, T)
+
  
- 
-        total_TTT_loss = torch.zeros((val_batch_size * block_size, 2 * model.cte.k * model.cte.h + 1, model.cte.tp), pin_memory=True)
+
         for epoch in range(epoch_cte_TTT):
+            total_TTT_loss = torch.zeros((val_batch_size * block_size, 2 * model.cte.k * model.cte.h + 1, model.cte.tp), pin_memory=True)
+            model.cte.TTT_epoch = epoch
+            model.cte.TTT_T     = train_cache.size(0) * TTT_batch_size * block_size
+            
+            _xb_train, _idi_train = None, None
             for i, pos_id in enumerate(range(0, train_cache.size(0), TTT_batch_size)): # 每次取出 TTT_batch_size 个样本
                 ### step 2: 获取当前拿来 test-time training 的数据
+                model.cte.TTT_ci = pos_id * block_size
+                
                 ix_train = train_cache[pos_id : pos_id + TTT_batch_size] # (tB)
                 xb_train, idi_train, yb_train, _ = get_batch('train', ix=ix_train) # (tB, T), (tB, T), (tB, T)
+                if _xb_train is None:
+                    _xb_train = xb_train
+                    _idi_train = idi_train
 
                 TTT_loss = model.TTT_cte_forward(
                     xb_train, xb_val,
                     idi_val[:, :block_size], idi_train[:, :block_size],
-                    yb_val
+                    yb_val,
                 ) # (vB * T, C, tp)
                 
                 total_TTT_loss += TTT_loss
                 print(f"epoch: {epoch} / {epoch_cte_TTT}, step: {i} / {train_cache.size(0) // TTT_batch_size}, TTT_loss: {TTT_loss.mean().item()}")
 
+
+            # sim_eu, sim_ct = model.get_sim(xb_val[0:1], _xb_train[0:1], idi_val[0, :block_size], _idi_train[0, :block_size])
+            # visualize_pair_bihclust(sim_eu, sim_ct, 
+            #                         title_A='Left Test, Top Train, Cosine Similarity',
+            #                         title_B='Left Test, Top Train, Cosine Similarity',
+            #                         save_path_A=f'./vis/0TTT_eu_sim_before_e{epoch}.png',
+            #                         save_path_B=f'./vis/0TTT_ct_sim_before_e{epoch}.png')
+
+
+            # print(f"[epoch {epoch}] locations range: min={model.cte.locations[0].min().item()}, max={model.cte.locations[0].max().item()}, emb_size={model.cte.emb_size}")
             model.cte.update_TTT(total_TTT_loss) # 全局更新
-            loss_eu, loss_ct = model.TTT_get_loss(xb_val, idi_val[:, :block_size], yb_val) # (vB, T)
+            loss_eu, loss_ct, logits_eu, logits_ct = model.TTT_get_loss(xb_val, idi_val[:, :block_size], yb_val) # (vB, T)
             print(f"epoch: {epoch} / {epoch_cte_TTT}, val_loss_eu: {loss_eu.mean().item()}, val_loss_ct: {loss_ct.mean().item()}")
+            # print(f"[epoch {epoch}] locations range: min={model.cte.locations[0].min().item()}, max={model.cte.locations[0].max().item()}, emb_size={model.cte.emb_size}")
             
+            sim_eu, sim_ct = model.get_sim(xb_val[0:1], _xb_train[0:1], idi_val[0, :block_size], _idi_train[0, :block_size])
+            if epoch == epoch_cte_TTT - 1:
+                visualize_pair_bihclust(sim_eu, sim_ct, 
+                                        title_A='Left Test, Top Train, Cosine Similarity',
+                                        title_B='Left Test, Top Train, Cosine Similarity',
+                                        save_path_A=f'./vis/00TTT_eu_sim_after_e{epoch}_b{block_size}.png',
+                                        save_path_B=f'./vis/00TTT_ct_sim_after_e{epoch}_b{block_size}.png')
+
             
         break # 只测试某一个 val
             
@@ -408,7 +472,8 @@ def validate_cte(gpt_cktp: str, cte_cktp: str, train_cache_cktp: str):
 def visualize_similarity(model, var, iter):
     emb_eu = var['emb_normed'][0]
     emb_ct = model.cte.main_locations[var['idi'][0].cpu()]
-
+    print(emb_eu.shape)
+    
     # --- 相似度矩阵 (eu) ---
     S = torch.matmul(emb_eu, emb_eu.T).cpu().numpy()
     np.fill_diagonal(S, 1.0)
@@ -500,17 +565,22 @@ def visualize_similarity(model, var, iter):
 
 
 if __name__ == "__main__":
-    gpt_ckpt = "iters_4000.pth"
-    cte_ckpt = "gpt_iters_4000_cte_iters_{}.pth"
-    train_cache_ckpt = "gpt_iters_4000_cte_iters_{}_train_cache.pth"
+    gpt_ckpt = f"b_512" + "iters_2999.pth"
+    cte_ckpt = f"b_{block_size}" + "gpt_iters_2999_cte_iters_{}.pth"
+    train_cache_ckpt = f"b_{block_size}" + "gpt_iters_2999_cte_iters_{}_train_cache.pth"
+
+
+
+    # train_gpt(gpt_ckpt)
     
-    # train_gpt()
     # train_cte(os.path.join(gpt_path, gpt_ckpt),
     #           os.path.join(cte_path, cte_ckpt),
     #           os.path.join(train_cache_path, train_cache_ckpt))
     
     
-    validate_cte(os.path.join(gpt_path, gpt_ckpt),
-              os.path.join(cte_path, cte_ckpt.format(100)),
-              os.path.join(train_cache_path, train_cache_ckpt.format(100)))
+    validate_cte(
+        os.path.join(gpt_path, gpt_ckpt),
+        os.path.join(cte_path, cte_ckpt.format(0)),
+        os.path.join(train_cache_path, train_cache_ckpt.format(0))
+    )
                  

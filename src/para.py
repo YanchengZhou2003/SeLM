@@ -1,3 +1,4 @@
+import argparse
 import os
 
 import torch
@@ -6,14 +7,23 @@ from src.utils import LossTypeDict
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
 
+# Parse command-line arguments
+parser = argparse.ArgumentParser(description="Set hyperparameters for the model.")
+parser.add_argument("--block_size", type=int, default=128, help="Maximum context length for predictions.")
+args = parser.parse_args()
+
+# Update block_size with the value from command-line arguments
+
+
+
 # hyperparameters - gpt
-batch_size = 32 # how many independent sequences will we process in parallel?
+batch_size = 1    # how many independent sequences will we process in parallel?
 val_batch_size = 1
-TTT_batch_size = 256
-block_size = 128 # what is the maximum context length for predictions?
-max_iters = 10000
+TTT_batch_size = 1
+block_size = args.block_size # what is the maximum context length for predictions?
+max_iters = 1
 gpt_save_interval = 1000
-cte_save_interval = 100
+cte_save_interval = 1
 learning_rate = 3e-4
 device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 eval_iters = 10
@@ -33,25 +43,43 @@ division_fact=1
 
 
 loss_type: LossTypeDict = {
-    'dyn_loss'  : 'square', # dyn:  dynamic
+    'dyn_loss'  : 'lap', # dyn:  dynamic
     'sta_loss'  : 'square', # sta:  static
     'prob_loss' : 'js' ,    # prob: probability
     30: {
         'target'  : 'sta_only' , 
         'converge': 20
     }, # 50  < epoch <= 100 时仅优化 sta_loss，在第 80 个 epoch 开始 converge
-    80: {
-        'target'  : 'prob_only' , 
-        'converge': 60
-    },
-    200: {
+    150: {
         'target'  : 'weighted_dyn_prob',
         'converge': 80,
-        'ratio_dyn' : 0.98,
-        'ratio_prob': 0.02   
+        'ratio_dyn' : 0.9950,
+        'ratio_prob': 0.0050  
     }
 }
-epoch_cte=200
+epoch_cte=150
+
+'''
+这个拟合效果比较好, loss 还低
+loss_type: LossTypeDict = {
+    'dyn_loss'  : 'lap', # dyn:  dynamic
+    'sta_loss'  : 'square', # sta:  static
+    'prob_loss' : 'js' ,    # prob: probability
+    30: {
+        'target'  : 'sta_only' , 
+        'converge': 20
+    }, # 50  < epoch <= 100 时仅优化 sta_loss，在第 80 个 epoch 开始 converge
+    150: {
+        'target'  : 'weighted_dyn_prob',
+        'converge': 80,
+        'ratio_dyn' : 0.99,
+        'ratio_prob': 0.01   
+    }
+}
+epoch_cte=150
+'''
+
+
 ### dyn_loss / sta_loss 可选: 'abs', 'square'
 ### prob_loss 可选: 'kl' , 'js'
 ### method    可选: 
@@ -62,13 +90,14 @@ epoch_cte=200
 ##### 'name': 'weighted_dyn_prob'  , 表示加权优化. 需要额外指定 'ratio_dyn' 和 'ratio_prob', 且它们加和为 1
 
 TTT_loss_type : LossTypeDict = {
-    'dyn_loss'    : 'square', # dyn:  dynamic
+    'dyn_loss'    : 'square'      , # dyn:  dynamic
     -1: {
         'target'  : 'TTT_only' , 
-        'converge': 0
+        'converge': 80
     }, 
 }
-epoch_cte_TTT=25
+epoch_cte_TTT=100
+sample_k = 1
 
 # ------------
 
@@ -89,5 +118,5 @@ vocab_size = len(chars)
 gpt_path = './ckpt/gpt'
 cte_path = './ckpt/cte'
 train_cache_path = './ckpt/cte'
-sim_eu_path = './vis/sim_eu_i{}.png'
-sim_ct_path = './vis/sim_ct_i{}.png'
+sim_eu_path = './vis/' + f'b_{block_size}' + 'sim_eu_i{}.png'
+sim_ct_path = './vis/' + f'b_{block_size}' + 'sim_ct_i{}.png'

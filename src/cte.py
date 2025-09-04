@@ -6,14 +6,15 @@ from datetime import datetime
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
-from scipy.cluster.hierarchy import leaves_list, linkage, dendrogram, optimal_leaf_ordering
-from scipy.spatial.distance import pdist, squareform
 from matplotlib.colors import PowerNorm
+from scipy.cluster.hierarchy import (dendrogram, leaves_list, linkage,
+                                     optimal_leaf_ordering)
+from scipy.spatial.distance import pdist, squareform
 from torch.nn import functional as F
 
 from src.loom_kernel import triton_loom_wrapper
 from src.loss import compute_loss
-from src.para import batch_size, block_size, vocab_size
+from src.para import batch_size, block_size, sample_k, vocab_size
 from src.utils import *
 
 main_device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
@@ -50,15 +51,29 @@ class CritiGraph(torch.nn.Module):
         self.convergence = convergence
         self.emb_size = emb_size
         self.blk_size = blk_size
-        self.locations = torch.randint(1 - self.n, self.n, (self.emb_size, self.tp), dtype=torch.int64, device=main_device)
-        self.locations = [self.locations.clone().to(dev) for dev in self.devices]
-        self.loss_type = loss_type
+        
+        self.raw_locations = torch.randint(1 - self.n, self.n, (self.emb_size, self.tp), dtype=torch.int64, device='cpu')
+        self.locations = [torch.empty_like(self.raw_locations, device=dev) for dev in self.devices]
+        for i in range(0, len(self.locations)):
+            self.locations[i].copy_(self.raw_locations, non_blocking=True)
+        torch.cuda.synchronize()
+        
+        self.loss_type   = loss_type
         self.sta_TTT     = [None for i in range(len(self.devices))]
         self.sta_loc_TTT = [None for i in range(len(self.devices))]
         self.cnc_loc_TTT = [None for i in range(len(self.devices))]
+        self.TTT_epoch   = -1
+        self.sample_k    = sample_k
+        self.TTT_T       = -1
+        self.TTT_ci      = -1
+
 
         self.register_buffer('main_locations', self.locations[0].clone().cpu())
         self.main_distance_lookup_table = self.distance_lookup_table[0].clone().cpu()
+        self.debug_epoch = False
+        
+        torch.cuda.empty_cache()
+        
         
     def generate_distance_lookup_table(self):
         xor_results = torch.arange(self.n, dtype=torch.int64, device=main_device)
@@ -68,10 +83,8 @@ class CritiGraph(torch.nn.Module):
     def distance(self, coord1: torch.Tensor, coord2: torch.Tensor, norm: torch.Tensor, dev_num=0):
         # sg = torch.sign(coord1) * torch.sign(coord2)
         sg = (((coord1 >= 0).to(torch.int16) << 1) - 1) * (((coord2 >= 0).to(torch.int16) << 1) - 1)
-        # sg = 1 - (((coord1 >= 0) ^ (coord2 >= 0)).to(torch.int16) << 1) 
-        
-        xor_result = torch.bitwise_xor(torch.abs(coord1), torch.abs(coord2))
-        # 关键替换：用 frexp 得到 log2_floor+1
+        # sg = 1 - (((coord1 >= 0) ^ (coord2 >= 0)).to(torch.int16) << 1)
+        xor_result = torch.abs(coord1) ^ torch.abs(coord2)
         # _, exp = torch.frexp((xor_result + 1).to(torch.float32))
         # s = exp.float() / self.h
         s = self.distance_lookup_table[dev_num][xor_result]
@@ -266,7 +279,8 @@ class CritiGraph(torch.nn.Module):
         b_val_n   : torch.Tensor,  # (B, T)   , 代表 欧式空间的范数乘积
         mode      : str
     ):
-        
+
+
         B, T, C, D = b_val_v.shape[0], b_val_v.shape[1], 2 * self.h * self.k + 1, self.tp
         splits = torch.linspace(0, T, len(self.devices) + 1, dtype=torch.int64).tolist()
         splits = list(map(int, splits))
@@ -277,7 +291,9 @@ class CritiGraph(torch.nn.Module):
             self.sta_loc_TTT = [self.locations[i][self.sta_TTT[i]].to(dev, non_blocking=True) for i, dev in enumerate(self.devices)]
             _cnc_loc_TTT = self.connection(torch.abs(self.sta_loc_TTT[0]), dev_num=0)
             self.cnc_loc_TTT = [_cnc_loc_TTT.clone().to(dev, non_blocking=True) for dev in self.devices]
-            
+            self.neighbor_batch_TTT(B, self.TTT_T, -1, -1, 0)
+        
+            torch.cuda.synchronize()
 
         for i, (dev, stream, (s, e)) in enumerate(zip(self.devices, self.streams, zip(splits[:-1], splits[1:]))):
             if s == e: continue
@@ -299,7 +315,6 @@ class CritiGraph(torch.nn.Module):
                 sta_loc: torch.Tensor = self.sta_loc_TTT[i] # (B, tp)
                 cnc_loc: torch.Tensor = self.cnc_loc_TTT[i] # (B, C, tp)
                 
-                cT = pos.size(0) # type: ignore
                 pos_loc = self.locations[i][pos] # (cT, tp)
                 dis_sta_pos     = self.distance(
                     sta_loc[:, None, :]   , pos_loc[None, :, :]     , val_n[..., None]      , dev_num=dev_num
@@ -307,28 +322,29 @@ class CritiGraph(torch.nn.Module):
                 
                 #### step 2: 获取候选位置（的值）
                 dis_sta_pos_sum = dis_sta_pos.sum(dim=-1) 
-                   # (B, cT)
+                # (B, cT)
                 dis_cnc_pos     = self.distance(
                     cnc_loc[:, None, :, :], pos_loc[None, :, None, :], val_n[..., None, None], dev_num=dev_num
                 )  # (B, cT, C, tp)
                 ct_val          = (
                     dis_sta_pos_sum[:, :, None, None] - dis_sta_pos[:, :, None, :] + dis_cnc_pos
                 ) / self.tp  #   (B, cT, C, tp)
-                             #    对于 B 个 batch，T1 个 starting point，向 T2 个 positive sample 连边。此时，我们把其中某个 positive sample 替换为 connected sample，共有 C 个；此时，D 个维度上的的距离是多少？
+                            #    对于 B 个 batch，T1 个 starting point，向 T2 个 positive sample 连边。此时，我们把其中某个 positive sample 替换为 connected sample，共有 C 个；此时，D 个维度上的的距离是多少？
                 
                 #### step 3: 计算 loss
                 ct_val    = ct_val                                                                # (B, cT, C, tp)
                 eu_val    = val_v[..., None, None].expand(ct_val.shape)                           # (B, cT, C, tp)
-                mask, lth = self.neighbor_batch_TTT(B, cT, dev_num=dev_num,)                      # (B, cT), (B, )
+                mask, lth = self.neighbor_batch_TTT(B, self.TTT_T, self.TTT_ci + s, self.TTT_ci + e, dev_num=dev_num,)                      # (B, cT), (B, )
                 loss      = self.calc_loss(ct_val, eu_val, mask[..., None, None], lth[..., None, None], 
-                                           epoch=-1, mode=mode)                                # (B, C, tp)
-                    
+                                        epoch=-1, mode=mode, sum_dim=1)                                # (B, C, tp)
 
                 ### 计算：计算结束 ###
                 
                 ### 通信2：数据传输开始 ###
                 all_avg_loss[i].copy_(loss, non_blocking=True)
                 ### 通信2：数据传输结束 ###
+        
+
         
         for i, stream in enumerate(self.streams):
             stream.synchronize()
@@ -406,16 +422,99 @@ class CritiGraph(torch.nn.Module):
                             torch.full((B, T1), T2, dtype=torch.float32, device=device),
                             torch.ones((B, T1), dtype=torch.float32, device=device))
         return valid_mask, counts
-
-    def neighbor_batch_TTT(self, B: int, cT: int, dev_num: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    
+    def neighbor_batch_TTT(
+        self,
+        B: int,
+        T: int,
+        cT_l: int,
+        cT_r: int,
+        dev_num: int = 0
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        返回:
+            valid_mask: (B, cT)  布尔张量
+            counts    : (B,)     float32
+        说明:
+            - 内部持久化:
+                self.choosing_mask: (B,)  bool
+                self.valid_samples: (B, k) int64，"全选"行填 -1
+                self.all_idx: (n_all,) long，全选批次索引
+                self.sel_idx: (n_sel,) long，非全选批次索引
+                self.samples: (n_sel, k) int64，非全选批次的全局采样
+        """
         device = self.devices[dev_num]
+        assert 0 <= cT_l < cT_r <= T or (cT_l == -1 and cT_r == -1), "切片边界不合法"
+        cT = int(cT_r - cT_l)
 
-        valid_mask = torch.ones((B, cT), dtype=torch.bool, device=device)
-        counts = torch.full((B, ), cT, dtype=torch.float32, device=device)
+        # 收敛期：与旧逻辑一致
+        if (self.loss_strategy['converge'] is not None and self.TTT_epoch > self.loss_strategy['converge']) or self.TTT_epoch == -1:
+            valid_mask = torch.ones((B, cT), dtype=torch.bool, device=device)
+            counts = torch.full((B,), float(cT), dtype=torch.float32, device=device)
+            return valid_mask, counts
+
+        # ---------- 初始化 choosing_mask 与 valid_samples ----------
+        if getattr(self, "valid_samples", None) is None:
+            # 80% 全选；20% 只用 k 个全局位置
+            self.choosing_mask = (torch.rand((B,), device=device) > 0.2)  # True=全选
+            k_eff = self.sample_k
+
+            # 占位: -1
+            self.valid_samples = torch.full(
+                (B, k_eff),
+                -1,
+                dtype=torch.int64,
+                device=device,
+            )
+
+            # 分批次索引持久化
+            self.all_idx = self.choosing_mask.nonzero(as_tuple=False).squeeze(1)   # 全选批次
+            self.sel_idx = (~self.choosing_mask).nonzero(as_tuple=False).squeeze(1)  # 非全选批次
+
+            # 对 20% 的“非全选”批次抽样
+            picked = torch.randint(
+                low=0,
+                high=T,
+                size=(self.sel_idx.numel(), k_eff),
+                device=device,
+                dtype=torch.int64
+            )  # (num_sel, k_eff)
+            self.valid_samples[self.sel_idx] = picked
+
+            # 预存非全选的采样
+            self.samples = self.valid_samples.index_select(0, self.sel_idx)  # (m, k_eff)
+            
+            # 将所有生成的 self.xxx 变量迁移到各个设备
+            self.choosing_mask = [self.choosing_mask.to(device) for device in self.devices]
+            self.valid_samples = [self.valid_samples.to(device) for device in self.devices]
+            self.all_idx = [self.all_idx.to(device) for device in self.devices]
+            self.sel_idx = [self.sel_idx.to(device) for device in self.devices]
+            self.samples = [self.samples.to(device) for device in self.devices]
+            
+            return None, None
+
+        # ---------- 基于当前切片 [cT_l, cT_r) 生成局部 mask 与 counts ----------
+        valid_mask = torch.zeros((B, cT), dtype=torch.bool, device=device)
+        counts = torch.zeros((B,), dtype=torch.float32, device=device)
+
+        # 全选批次
+        valid_mask[self.all_idx[dev_num]] = True
+        counts[self.all_idx[dev_num]] = float(cT)
+
+        # 非全选批次
+        pos = self.samples[dev_num] - int(cT_l)                   # (m, k)
+        in_slice = (pos >= 0) & (pos < cT)               # (m, k)
+
+        if in_slice.any():
+            rc = torch.nonzero(in_slice, as_tuple=False) # (p, 2)
+            b_idx = self.sel_idx[dev_num][rc[:, 0]]               # (p,)
+            cols = pos[rc[:, 0], rc[:, 1]].to(torch.int64)  # (p,)
+            valid_mask[b_idx, cols] = True
+
+        counts[self.sel_idx[dev_num]] = in_slice.sum(dim=1).to(torch.float32) + 1e-12
+
         return valid_mask, counts
 
-
-    
     # @timeit(name=f'cte 函数主体')
     def forward(self,        
                 sta     : torch.Tensor, # (B, T+V)     , 代表 每个 sta 样本在 locations 中的 id 
@@ -465,7 +564,7 @@ class CritiGraph(torch.nn.Module):
                 mode='sta')
             prob_loss = self.loom(epoch, sta[:,  :T]    , pos[:, T:T+V]  , val_v[:,  :T,   T:T+V]  , val_n[:,  :T,   T:T+V]  ,
                 mode='prob')
-            # print(f"current epoch: {epoch}, dyn_loss: {fmt6w(dyn_loss)}, sta_loss: {fmt6w(sta_loss)}, prob_loss: {fmt6w(prob_loss)}")
+            print(f"current epoch: {epoch}, dyn_loss: {fmt6w(dyn_loss)}, sta_loss: {fmt6w(sta_loss)}, prob_loss: {fmt6w(prob_loss)}")
         
         
         
@@ -485,8 +584,8 @@ class CritiGraph(torch.nn.Module):
         sta     : torch.Tensor, # (B)     , 代表 每个 sta 样本在 locations 中的 id 
         pos     : torch.Tensor, # (T)     , 代表 每个 pos 样本在 locations 中的 id 
         val_v   : torch.Tensor, # (B, T)  , 代表 欧式空间待拟合的值              
-        val_n   : torch.Tensor, # (B, T)  , 代表 欧式空间的范数乘积，除了 prob 对应的位置之外用 1.0 填充
-    ): 
+        val_n   : torch.Tensor, # (B, T)  , 代表 欧式空间的范数乘积，除了 prob 对应的位置之外用 1.0 填充,
+    ):        
         # assert mark is not None # 保证计时器存在
         B, T, V = sta.size(0), block_size, vocab_size
         ### 1. 生成用于传输数据的张量
@@ -514,12 +613,14 @@ class CritiGraph(torch.nn.Module):
         assert self.sta_TTT[0] is not None, "请先运行 forward_TTT 方法以初始化 TTT 状态"
         assert self.cnc_loc_TTT[0] is not None, "请先运行 forward_TTT 方法以初始化 TTT 状态"
 
+
+
         TTT_loss      = TTT_loss.to(self.devices[0])
-        indices       = torch.argmin(TTT_loss, dim=1)                                         # (B, tp)
-        batch_indices = torch.arange(self.sta_TTT[0].size(0), device=self.devices[0])[:, None, None]
-        dim_indices   = torch.arange(self.tp    ,             device=self.devices[0])[None, None, :]
+        indices       = torch.argmin(TTT_loss, dim=1)                                                # (B, tp)
+        batch_indices = torch.arange(self.sta_TTT[0].size(0), device=self.devices[0])[:, None]       # (B, 1)
+        dim_indices   = torch.arange(self.tp    ,             device=self.devices[0])[None :]        # (1, tp)
         selected_locs = self.cnc_loc_TTT[0][batch_indices, indices, dim_indices]        # (B, tp)
-        
+
         for i, dev in enumerate(self.devices):
             self.locations[i].index_copy_(
                 0,                                             # dim=0, 沿行更新
@@ -528,10 +629,11 @@ class CritiGraph(torch.nn.Module):
             )
         self.main_locations = self.locations[0].clone().cpu()
         
-        # 全局回设
+        # 全局重置
         self.sta_TTT      = [None for _ in range(len(self.devices))]
         self.sta_loc_TTT  = [None for _ in range(len(self.devices))]
         self.cnc_loc_TTT  = [None for _ in range(len(self.devices))]
+        self.valid_samples = None
 
 if __name__ == "__main__":
     pass

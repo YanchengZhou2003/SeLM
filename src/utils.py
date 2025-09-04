@@ -8,6 +8,7 @@ from typing import (Any, Callable, Dict, Iterable, List, Literal, Mapping,
 
 import matplotlib
 import torch
+import torch.nn.functional as F
 
 matplotlib.use("Agg")  # 使用无界面后端，避免在服务器/笔记本上弹窗  
 import warnings
@@ -357,68 +358,70 @@ def is_all_ones(
     return (False, dtype)
 
 
+from fnmatch import fnmatch
 from typing import Dict, Iterable, Tuple
 
 import torch
 
 
-def load_state_dict_skip_prefixes(
-    model: torch.nn.Module,
-    state_like: Dict[str, torch.Tensor],
-    prefixes_to_skip: Iterable[str] = ("cte",),
-    strict: bool = False,
-    verbose: bool = True
-) -> Tuple[Iterable[str], Iterable[str]]:
+def load_partial_state_dict(model, state_dict, skip_substrings=None, strict=False):
     """
-    将 state_dict 加载到 model，但跳过指定前缀的所有键（如 'cte', 'cte.*'）。
+    加载 state_dict 时跳过包含指定子串的参数。
     
     参数:
-      model: 目标模型
-      state_like: 可能是 state_dict 或 { 'state_dict': state_dict } 的对象
-      prefixes_to_skip: 需要跳过的前缀集合；会同时匹配精确键与其子键（k == p 或 k.startswith(p + '.'))
-      strict: 传给 model.load_state_dict 的 strict；通常建议 False
-      verbose: 打印被跳过的键与 load_state 结果
-
-    返回:
-      (missing_keys, unexpected_keys)：与 nn.Module.load_state_dict 一致
+        model          : torch.nn.Module
+        state_dict     : dict, 通常由 torch.load 得到
+        skip_substrings: List[str], 比如 ["cte", "bias"]，只要键名里含有这些子串就跳过
+        strict         : bool, 传给 load_state_dict
     """
-    # 1) 取出真正的 state_dict
-    if "state_dict" in state_like and isinstance(state_like["state_dict"], dict):
-        state_dict = state_like["state_dict"]
+    skip_substrings = skip_substrings or []
+
+    filtered_state = {}
+    for k, v in state_dict.items():
+        if any(substr in k for substr in skip_substrings):
+            continue
+        filtered_state[k] = v
+
+    missing, unexpected = model.load_state_dict(filtered_state, strict=strict)
+    print(missing, unexpected)
+    return missing, unexpected
+
+def truncate_embedding_state_dict(state_dict, key: str, b: int, mode: str = "truncate"):
+    """
+    修改 state_dict 中某个 nn.Embedding 的权重。
+
+    参数:
+        state_dict : dict，通常由 torch.load 得到
+        key        : str，Embedding 的键名，比如 "embedding.weight"
+        b          : int，只保留/覆盖前 b 行
+        mode       : str，可选:
+                       - "truncate": 把张量裁剪成 (b, E)，state_dict[key] 的形状直接变小
+                       - "partial" : 保持原始大小，只更新前 b 行，其余行保持不变
+    返回:
+        new_state_dict : dict，修改后的 state_dict
+    """
+    if key not in state_dict:
+        raise KeyError(f"{key} not found in state_dict")
+
+    W = state_dict[key]
+    if W.ndim != 2:
+        raise ValueError(f"{key} is not a 2D tensor, got shape {tuple(W.shape)}")
+    if b > W.size(0):
+        raise ValueError(f"b={b} > {W.size(0)} rows in {key}")
+
+    new_state_dict = state_dict.copy()
+
+    if mode == "truncate":
+        new_state_dict[key] = W[:b].clone()
+    elif mode == "partial":
+        # 保持大小不变，只更新前 b 行
+        W_new = W.clone()
+        W_new[b:] = torch.zeros_like(W_new[b:])  # 也可以保持原样
+        new_state_dict[key] = W_new
     else:
-        state_dict = state_like
+        raise ValueError(f"Unknown mode={mode}, expected 'truncate' or 'partial'")
 
-    # 2) 同时考虑 DDP 的 'module.' 前缀
-    #    我们扩展跳过列表，加入 'module.<prefix>'
-    expanded_prefixes = set(prefixes_to_skip)
-    expanded_prefixes.update([f"module.{p}" for p in prefixes_to_skip])
-
-    def should_skip(k: str) -> bool:
-        for p in expanded_prefixes:
-            if k == p or k.startswith(p + "."):
-                return True
-        return False
-
-    # 3) 过滤 state_dict
-    filtered = {k: v for k, v in state_dict.items() if not should_skip(k)}
-
-    if verbose:
-        skipped = [k for k in state_dict.keys() if should_skip(k)]
-        if skipped:
-            print(f"[load_state_dict_skip_prefixes] Skipped {len(skipped)} keys:")
-            for k in skipped:
-                print("  -", k)
-
-    # 4) 加载
-    load_result = model.load_state_dict(filtered, strict=strict)
-
-    if verbose:
-        missing, unexpected = load_result
-        print("[load_state_dict_skip_prefixes] load_state result:")
-        print("  missing_keys  :", missing)
-        print("  unexpected_keys:", unexpected)
-
-    return load_result
+    return new_state_dict
 
 def fetch_locals(*names: str) -> Dict[str, Any]:
     """
@@ -896,3 +899,187 @@ def save_paired_hierarchy_heatmaps(
     plt.close(fig)
     return path
 
+def make_soft_targets(
+    target: torch.LongTensor,
+    V: int,
+    eps: float = 0.1,
+    return_logits: bool = False,
+    ignore_index: int | None = None,
+    dtype: torch.dtype = torch.float32,
+    delta: float = 1e-6,
+):
+    """
+    将 (B, T) 的整数标签转换为“合理”的 (B, T, V) 目标：
+      - 默认返回 label smoothing 后的概率分布（soft targets）
+      - 可选返回与该分布一致的一组 logits（softmax 后还原该分布）
+
+    参数:
+      target: (B, T) LongTensor，值域 [0, V-1] 或为 ignore_index
+      V: 类别/词表大小
+      eps: label smoothing 系数 in [0, 1)
+      return_logits: 若为 True，返回 logits；否则返回概率分布
+      ignore_index: 可选，用于掩码的填充值（如 pad）。这些位置将被置为均匀分布或零向量（见下）
+      dtype: 输出张量的数据类型
+      delta: 构造 logits 时用于避免 log(0) 的下限
+
+    返回:
+      out: (B, T, V) 张量
+           - 当 return_logits=False: 每个位置为概率分布，和为 1
+           - 当 return_logits=True : 一组 logits，使 softmax(out) ≈ 上述分布
+
+    约定:
+      - 若提供 ignore_index，则对应位置的行为：
+        * return_logits=False: 返回均匀分布（对损失进行掩码时通常无影响）
+        * return_logits=True : 返回零向量 logits（softmax 为均匀分布）
+    """
+    assert target.dim() == 2, "target should be (B, T)"
+    assert V > 1, "V must be > 1"
+    assert 0 <= eps < 1, "eps must be in [0, 1)"
+
+    B, T = target.shape
+    device = target.device
+
+    # 1) 构造平滑分布
+    probs = torch.full((B, T, V), eps / (V - 1), device=device, dtype=dtype)
+    # 掩码：有效位置
+    if ignore_index is None:
+        idx = target.unsqueeze(-1)  # (B, T, 1)
+        probs.scatter_(dim=-1, index=idx, value=1.0 - eps)
+    else:
+        valid = (target != ignore_index)
+        # 先全部填充均匀分布（对 ignore_index 位置即为最终分布）
+        # 对有效位置再 scatter 为平滑分布
+        if valid.any():
+            idx = target.clamp_min(0).unsqueeze(-1)  # 避免 scatter 索引为负
+            probs[valid] = eps / (V - 1)
+            probs.scatter_(dim=-1, index=idx, value=1.0 - eps)
+
+    if not return_logits:
+        return probs
+
+    # 2) 从分布构造一组 logits（非唯一；softmax 后还原 probs）
+    safe = probs.clamp_min(delta)
+    logits = safe.log()
+    # 去掉每个位置的常数自由度（使均值为 0，不影响 softmax）
+    logits = logits - logits.mean(dim=-1, keepdim=True)
+
+    # 对 ignore_index 位置，返回零向量 logits（softmax 为均匀分布）
+    if ignore_index is not None:
+        invalid = (target == ignore_index)
+        if invalid.any():
+            logits[invalid] = 0.0
+
+    return logits
+
+
+@torch.no_grad()
+def directed_label_smoothing(
+    targets: torch.LongTensor,          # (B, T)
+    teacher_logits: torch.Tensor,       # (B, T, V)
+    mode: Literal["mul", "add"] = "mul",
+    alpha: float = 1.2,                 # 正类增强因子 (>1)
+    beta: float = 0.9,                  # 负类衰减因子 (<1, >0)
+    add_gamma: float = 0.05,            # add 模式时正类加成
+    min_prob: float = 1e-8,             # 数值稳定下限
+    return_logits: bool = False,
+    ignore_index: int | None = None,
+    dtype: torch.dtype | None = None,
+):
+    """
+    基于教师 logits 的“定向 Label Smoothing”：
+      - 提升正确类概率，压低错误类概率，再归一化
+      - 支持乘法缩放("mul")或加法拉伸("add")
+
+    参数:
+      targets: (B, T) LongTensor, 类别索引，取值 [0, V-1] 或 ignore_index
+      teacher_logits: (B, T, V) 浮点张量
+      mode:
+        - "mul": 正类乘 alpha (>1)，负类乘 beta (0<beta<1)，后归一化（推荐）
+        - "add": 正类加 add_gamma (>0)，负类按原比例分配剩余质量
+      alpha, beta: 乘法模式的增强/衰减系数
+      add_gamma: 加法模式对正类的加成量
+      min_prob: 防止出现 0 概率导致后续 log 的数值问题
+      return_logits: 若 True，返回一组 logits（softmax 后还原该分布）
+      ignore_index: 若提供，忽略位置返回均匀分布（或零 logits）
+      dtype: 输出 dtype，默认跟 teacher_logits 一致
+
+    返回:
+      probs 或 logits: (B, T, V)
+    """
+    assert targets.dim() == 2, "targets should be (B, T)"
+    assert teacher_logits.dim() == 3, "teacher_logits should be (B, T, V)"
+    B, T = targets.shape
+    Bt, Tt, V = teacher_logits.shape
+    assert (B, T) == (Bt, Tt), "shapes of targets and teacher_logits must match in (B,T)"
+    if dtype is None:
+        dtype = teacher_logits.dtype
+
+    device = teacher_logits.device
+    targets = targets.to(device)
+
+    # 1) 教师概率
+    p = F.softmax(teacher_logits, dim=-1)  # (B, T, V)
+
+    # 2) 构建 mask
+    idx = targets.unsqueeze(-1)  # (B, T, 1)
+    if ignore_index is not None:
+        valid = (targets != ignore_index)
+        invalid = ~valid
+    else:
+        valid = torch.ones((B, T), dtype=torch.bool, device=device)
+        invalid = torch.zeros((B, T), dtype=torch.bool, device=device)
+
+    # 3) 定向 smoothing
+    probs = p.clone()
+
+    if mode == "mul":
+        # 乘法缩放：正类 * alpha, 负类 * beta，然后归一化
+        # 先对全部乘以 beta，再把正类乘以 (alpha/beta)
+        if not (alpha > 1.0 and 0.0 < beta < 1.0):
+            raise ValueError("For mode='mul', require alpha>1 and 0<beta<1.")
+        probs = probs * beta
+        # scatter 增强正类
+        scale = torch.full_like(probs[..., :1], fill_value=alpha / beta)
+        probs.scatter_(-1, idx, probs.gather(-1, idx) * (alpha / beta))
+
+        # 仅对有效位置归一化
+        denom = probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        probs = probs / denom
+
+    elif mode == "add":
+        # 加法拉伸：正类加 add_gamma，负类按比例缩放剩余概率
+        if not (add_gamma > 0):
+            raise ValueError("For mode='add', require add_gamma>0.")
+        # 取出正类概率
+        p_y = probs.gather(-1, idx)  # (B, T, 1)
+        # 负类总质量
+        neg_mass = (1.0 - p_y).clamp_min(1e-12)
+        # 新的正类概率
+        new_p_y = (p_y + add_gamma).clamp(max=1.0 - 1e-12)
+        # 剩余给负类的质量
+        remain = (1.0 - new_p_y)
+        # 负类按原比例分配
+        probs = probs * (remain / neg_mass)
+        probs.scatter_(-1, idx, new_p_y)
+    else:
+        raise ValueError("mode must be 'mul' or 'add'.")
+
+    # 4) ignore_index 位置设为均匀分布
+    if invalid.any():
+        uniform = torch.full((V,), 1.0 / V, device=device, dtype=probs.dtype)
+        probs[invalid] = uniform
+
+    # 5) 数值稳定与 dtype
+    probs = probs.clamp_min(min_prob)
+    probs = probs / probs.sum(dim=-1, keepdim=True)  # 再归一，确保严格为分布
+    probs = probs.to(dtype)
+
+    if not return_logits:
+        return probs
+
+    # 6) 构造对应 logits（可选）
+    logits = probs.clamp_min(min_prob).log()
+    logits = logits - logits.mean(dim=-1, keepdim=True)
+    if invalid.any():
+        logits[invalid] = 0.0  # 对应均匀分布
+    return logits

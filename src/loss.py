@@ -56,6 +56,7 @@ def js_div(
     else:
         raise ValueError(f"Invalid reduction: {reduction}")
     
+    
 
 def compute_loss(
     kind: str,
@@ -79,6 +80,12 @@ def compute_loss(
         loss = loss * mask
         loss = loss.sum(dim=sum_dim) / lth            # (B, T1, C, tp)
         return loss
+    
+    if kind == 'lap':
+        loss = torch.square(ct_val - eu_val) * torch.abs(eu_val)          # (B, T1, T2, C, tp)
+        loss = loss * mask
+        loss = loss.sum(dim=sum_dim) / lth            # (B, T1, C, tp)
+        return loss        
 
     if kind == 'abs':
         loss = torch.abs(ct_val - eu_val)             # (B, T1, T2, C, tp)
